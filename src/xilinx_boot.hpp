@@ -27,6 +27,10 @@ namespace zynq7000 {
         uint32_t image_header_table_offset; // 0x98
         uint32_t partition_header_table_offset; // 0x9C
     };
+
+    struct RegisterInitTable {
+        uint8_t data[0x800]; // 0xA0 - 0x89F
+    };
     
     struct ImageHeaderTable {
         uint32_t version;               // 0x00
@@ -34,6 +38,14 @@ namespace zynq7000 {
         uint32_t first_partition_header_offset; // 0x08
         uint32_t first_image_header_offset;     // 0x0C
         uint32_t header_authentication_certificate; // 0x10
+    };
+
+    struct ImageHeader {
+        uint32_t next_image_header_offset;      // 0x00 (word offset)
+        uint32_t corresponding_partition_header; // 0x04 (word offset)
+        uint32_t reserved;                      // 0x08
+        uint32_t partition_count;               // 0x0C
+        uint32_t image_name_words[1];           // 0x10 (variable)
     };
     
     struct PartitionHeader {
@@ -76,6 +88,14 @@ namespace zynqmp {
         uint32_t obfuscated_black_key_iv[3]; // 0xAC
     };
 
+    struct RegisterInitTable {
+        uint8_t data[0x800]; // 0xB8 - 0x8B7
+    };
+
+    struct PufHelperData {
+        uint8_t data[0x608]; // 0x8B8 - 0xF2F
+    };
+
     struct ImageHeaderTable {
         uint32_t version;               // 0x00
         uint32_t count_of_image_header; // 0x04
@@ -85,6 +105,14 @@ namespace zynqmp {
         uint32_t secondary_boot_device; // 0x14
         uint32_t padding[8];            // 0x18
         uint32_t checksum;              // 0x3C
+    };
+
+    struct ImageHeader {
+        uint32_t next_image_header_offset;      // 0x00 (word offset)
+        uint32_t corresponding_partition_header; // 0x04 (word offset)
+        uint32_t reserved;                      // 0x08
+        uint32_t partition_count;               // 0x0C
+        uint32_t image_name_words[1];           // 0x10 (variable)
     };
 
     struct PartitionHeader {
@@ -129,6 +157,14 @@ namespace versal {
         uint32_t meta_header_offset;   // 0xC4
         uint32_t reserved2[24];        // 0xC8 - 0x124
     };
+
+    struct RegisterInitTable {
+        uint8_t data[0x800]; // 0x128 - 0x927
+    };
+
+    struct PufHelperData {
+        uint8_t data[0x608]; // 0x928 - 0xF2F
+    };
     
     struct ImageHeaderTable {
         uint32_t version;               // 0x00
@@ -159,6 +195,22 @@ namespace versal {
         uint32_t actual_hash_block_sig_size; // 0x74
         uint32_t reserved3;             // 0x78
         uint32_t checksum;              // 0x7C
+    };
+
+    struct ImageHeader {
+        uint32_t first_partition_header_word_offset; // 0x00
+        uint32_t partition_count;                    // 0x04
+        uint32_t revoke_id;                          // 0x08
+        uint32_t image_attributes;                   // 0x0C
+        char image_name[16];                         // 0x10-0x1C
+        uint32_t image_node_id;                      // 0x20
+        uint32_t unique_id;                          // 0x24
+        uint32_t parent_unique_id;                   // 0x28
+        uint32_t function_id;                        // 0x2C
+        uint32_t copy_to_memory_address_low;         // 0x30
+        uint32_t copy_to_memory_address_high;        // 0x34
+        uint32_t reserved;                           // 0x38
+        uint32_t checksum;                           // 0x3C
     };
 
     struct PartitionHeader {

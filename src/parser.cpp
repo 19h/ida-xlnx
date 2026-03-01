@@ -1,6 +1,8 @@
 #include "parser.hpp"
 #include <cstdio>
 #include <ctype.h>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace xilinx {
 
@@ -28,6 +30,367 @@ static void add_warning(ParsedImage& img, LogCallback logger, const std::string&
     img.warnings.push_back(message);
     if (logger) {
         logger("WARNING: " + message + "\n");
+    }
+}
+
+static bool is_placeholder_word(uint32_t value) {
+    return value == 0 || value == 0xFFFFFFFF;
+}
+
+static bool has_non_placeholder_word(const uint32_t* words, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        if (!is_placeholder_word(words[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void set_key_source_metadata(ParsedImage& img, uint32_t key_source) {
+    img.boot_header.key_source = key_source;
+    img.boot_header.key_source_present = !is_placeholder_word(key_source);
+}
+
+static void set_iv_metadata(std::vector<uint32_t>& dest,
+                            bool& present,
+                            const uint32_t* words,
+                            size_t count) {
+    dest.assign(words, words + count);
+    present = has_non_placeholder_word(words, count);
+}
+
+static void add_boot_attribute(ParsedImage& img, const std::string& name, uint32_t value) {
+    img.boot_header.boot_attributes.push_back(BootAttributeWord{.name = name, .value = value});
+}
+
+static bool is_readable_range(Reader& reader, uint64_t offset, uint64_t length) {
+    if (length == 0 || offset == 0xFFFFFFFFULL || length == 0xFFFFFFFFULL) {
+        return false;
+    }
+    if (offset > UINT64_MAX - (length - 1)) {
+        return false;
+    }
+
+    uint8_t byte = 0;
+    if (!reader.read_bytes(offset, &byte, 1)) {
+        return false;
+    }
+    if (!reader.read_bytes(offset + length - 1, &byte, 1)) {
+        return false;
+    }
+    return true;
+}
+
+static void add_boot_image_range(ParsedImage& img,
+                                 Reader& reader,
+                                 LogCallback logger,
+                                 const std::string& name,
+                                 uint64_t offset,
+                                 uint64_t length) {
+    if (offset == 0 || offset == 0xFFFFFFFFULL || length == 0 || length == 0xFFFFFFFFULL) {
+        return;
+    }
+
+    BootImageRange range;
+    range.name = name;
+    range.offset = offset;
+    range.length = length;
+    range.bounds_valid = is_readable_range(reader, offset, length);
+    img.boot_header.image_ranges.push_back(range);
+
+    if (!range.bounds_valid) {
+        char msg[256] = {0};
+        std::snprintf(msg,
+                      sizeof(msg),
+                      "%s range appears out-of-bounds or unreadable (offset=0x%llX, length=0x%llX).",
+                      name.c_str(),
+                      static_cast<unsigned long long>(offset),
+                      static_cast<unsigned long long>(length));
+        add_warning(img, logger, msg);
+    }
+}
+
+static void add_boot_region_diagnostic(ParsedImage& img,
+                                       Reader& reader,
+                                       LogCallback logger,
+                                       const std::string& name,
+                                       uint64_t offset,
+                                       uint64_t size,
+                                       MetadataChecksumStatus checksum_status = MetadataChecksumStatus::NotPresent) {
+    BootRegionDiagnostic diagnostic;
+    diagnostic.name = name;
+    diagnostic.present = offset != 0 && offset != 0xFFFFFFFFULL && size != 0 && size != 0xFFFFFFFFULL;
+    diagnostic.offset = offset;
+    diagnostic.size = size;
+    diagnostic.bounds_valid = diagnostic.present && is_readable_range(reader, offset, size);
+    diagnostic.checksum_status = checksum_status;
+    img.boot_header.region_diagnostics.push_back(diagnostic);
+
+    if (diagnostic.present && !diagnostic.bounds_valid) {
+        char msg[256] = {0};
+        std::snprintf(msg,
+                      sizeof(msg),
+                      "%s diagnostic region is unreadable (offset=0x%llX, size=0x%llX).",
+                      name.c_str(),
+                      static_cast<unsigned long long>(offset),
+                      static_cast<unsigned long long>(size));
+        add_warning(img, logger, msg);
+    }
+}
+
+static OptionalDataChecksumStatus parse_optional_data_checksum_status(const std::vector<uint32_t>& words,
+                                                                      uint32_t& checksum_word_out) {
+    checksum_word_out = 0;
+    if (words.size() < 2) {
+        return OptionalDataChecksumStatus::NotPresent;
+    }
+
+    checksum_word_out = words.back();
+    uint32_t sum = 0;
+    for (size_t i = 0; i + 1 < words.size(); ++i) {
+        sum += words[i];
+    }
+    return sum == checksum_word_out ? OptionalDataChecksumStatus::Valid : OptionalDataChecksumStatus::Invalid;
+}
+
+static void parse_versal_optional_data(Reader& reader,
+                                       ParsedImage& img,
+                                       LogCallback logger,
+                                       const versal::ImageHeaderTable& iht,
+                                       uint32_t image_header_table_offset) {
+    const uint32_t total_optional_words = iht.optional_data_length;
+    if (total_optional_words == 0 || total_optional_words == 0xFFFFFFFF) {
+        return;
+    }
+
+    uint64_t cursor = static_cast<uint64_t>(image_header_table_offset) + sizeof(versal::ImageHeaderTable);
+    uint32_t consumed_words = 0;
+
+    while (consumed_words < total_optional_words) {
+        uint32_t header_word = 0;
+        if (!reader.read_bytes(cursor, &header_word, sizeof(header_word))) {
+            add_warning(img, logger, "Optional data parsing stopped: failed to read optional-data entry header.");
+            break;
+        }
+
+        OptionalDataEntry entry;
+        entry.id = static_cast<uint16_t>(header_word & 0xFFFF);
+        entry.size_words = static_cast<uint16_t>((header_word >> 16) & 0xFFFF);
+        entry.offset = cursor;
+
+        if (entry.size_words == 0) {
+            add_warning(img, logger, "Optional data parsing stopped: encountered entry with zero size.");
+            break;
+        }
+        if (consumed_words + entry.size_words > total_optional_words) {
+            add_warning(img, logger, "Optional data parsing stopped: entry size exceeds declared optional-data length.");
+            break;
+        }
+
+        std::vector<uint32_t> entry_words(entry.size_words, 0);
+        if (!reader.read_bytes(cursor, entry_words.data(), static_cast<size_t>(entry.size_words) * sizeof(uint32_t))) {
+            add_warning(img, logger, "Optional data parsing stopped: failed to read full optional-data entry payload.");
+            break;
+        }
+
+        if (entry_words.size() > 2) {
+            entry.data_words.assign(entry_words.begin() + 1, entry_words.end() - 1);
+        }
+
+        entry.checksum_status = parse_optional_data_checksum_status(entry_words, entry.checksum_word);
+        if (entry.checksum_status == OptionalDataChecksumStatus::Invalid) {
+            char msg[256] = {0};
+            std::snprintf(msg,
+                          sizeof(msg),
+                          "Optional data entry ID=%u at 0x%llX failed checksum validation.",
+                          static_cast<unsigned>(entry.id),
+                          static_cast<unsigned long long>(entry.offset));
+            add_warning(img, logger, msg);
+        }
+
+        img.boot_header.optional_data_entries.push_back(std::move(entry));
+
+        cursor += static_cast<uint64_t>(entry.size_words) * 4;
+        consumed_words += entry.size_words;
+    }
+
+    if (consumed_words != total_optional_words) {
+        add_warning(img,
+                    logger,
+                    "Optional data parsing consumed fewer words than declared by Optional Data Length field.");
+    }
+}
+
+struct ImageHeaderContext {
+    std::string name;
+    uint32_t partition_count = 0;
+    uint32_t first_partition_header_offset = 0; // bytes
+};
+
+struct VersalImageHeaderContext {
+    std::string name;
+    uint32_t first_partition_header_offset = 0; // bytes
+    uint32_t partition_count = 0;
+};
+
+static std::string sanitize_name(std::string value) {
+    for (char& c : value) {
+        if (!isalnum(c) && c != '_' && c != '.') {
+            c = '_';
+        }
+    }
+    return value;
+}
+
+static std::string parse_versal_image_name(const versal::ImageHeader& ih) {
+    std::string name;
+    for (char c : ih.image_name) {
+        if (c == '\0') {
+            break;
+        }
+        name.push_back(c);
+    }
+    return sanitize_name(name);
+}
+
+static std::vector<VersalImageHeaderContext> parse_versal_image_headers(Reader& reader,
+                                                                         uint32_t first_image_header_word_offset,
+                                                                         uint32_t total_images) {
+    std::vector<VersalImageHeaderContext> contexts;
+    if (first_image_header_word_offset == 0 || first_image_header_word_offset == 0xFFFFFFFF || total_images == 0 ||
+        total_images == 0xFFFFFFFF) {
+        return contexts;
+    }
+
+    const uint32_t first_image_header_offset = first_image_header_word_offset * 4;
+    for (uint32_t i = 0; i < total_images; ++i) {
+        versal::ImageHeader ih{};
+        const uint32_t ih_offset = first_image_header_offset + i * static_cast<uint32_t>(sizeof(versal::ImageHeader));
+        if (!reader.read_bytes(ih_offset, &ih, sizeof(ih))) {
+            break;
+        }
+
+        VersalImageHeaderContext ctx;
+        ctx.first_partition_header_offset = ih.first_partition_header_word_offset * 4;
+        ctx.partition_count = ih.partition_count;
+        ctx.name = parse_versal_image_name(ih);
+        contexts.push_back(std::move(ctx));
+    }
+
+    return contexts;
+}
+
+static std::unordered_map<uint32_t, std::string> build_versal_partition_owner_map(
+    Reader& reader,
+    const std::vector<VersalImageHeaderContext>& image_contexts,
+    ParsedImage& img,
+    LogCallback logger) {
+    std::unordered_map<uint32_t, std::string> owners;
+
+    for (size_t i = 0; i < image_contexts.size(); ++i) {
+        const auto& ctx = image_contexts[i];
+        const std::string image_name = ctx.name.empty() ? ("IMAGE_" + std::to_string(i)) : ctx.name;
+
+        if (ctx.first_partition_header_offset == 0 || ctx.first_partition_header_offset == 0xFFFFFFFF) {
+            add_warning(img,
+                        logger,
+                        "Versal image header has no valid first partition pointer; synthetic partition naming may be used.");
+            continue;
+        }
+
+        uint32_t current_partition_offset = ctx.first_partition_header_offset;
+        uint32_t traversed = 0;
+        while (current_partition_offset != 0 && current_partition_offset != 0xFFFFFFFF && traversed < ctx.partition_count) {
+            owners[current_partition_offset] = image_name;
+
+            versal::PartitionHeader ph{};
+            if (!reader.read_bytes(current_partition_offset, &ph, sizeof(ph))) {
+                break;
+            }
+            current_partition_offset = ph.next_partition_header_offset * 4;
+            traversed++;
+        }
+
+        if (ctx.partition_count != 0 && traversed != ctx.partition_count) {
+            char msg[256] = {0};
+            std::snprintf(msg,
+                          sizeof(msg),
+                          "Versal image '%s' declares %u partition(s) but traversed %u from its first partition link.",
+                          image_name.c_str(),
+                          ctx.partition_count,
+                          traversed);
+            add_warning(img, logger, msg);
+        }
+    }
+
+    return owners;
+}
+
+template <typename ImageHeaderT>
+static std::unordered_map<uint32_t, ImageHeaderContext> walk_image_header_chain(Reader& reader,
+                                                                                 uint32_t first_image_header_word_offset,
+                                                                                 uint32_t max_images) {
+    std::unordered_map<uint32_t, ImageHeaderContext> image_headers;
+    std::unordered_set<uint32_t> seen_offsets;
+
+    uint32_t current_word_offset = first_image_header_word_offset;
+    uint32_t image_count = 0;
+
+    while (current_word_offset != 0 && current_word_offset != 0xFFFFFFFF && image_count < max_images) {
+        const uint32_t current_offset = current_word_offset * 4;
+        if (!seen_offsets.insert(current_offset).second) {
+            break;
+        }
+
+        ImageHeaderT ih{};
+        if (!reader.read_bytes(current_offset, &ih, sizeof(ih))) {
+            break;
+        }
+
+        ImageHeaderContext ctx;
+        ctx.name = unpack_image_name(reader, current_offset);
+        ctx.partition_count = ih.partition_count;
+        ctx.first_partition_header_offset = ih.corresponding_partition_header * 4;
+        image_headers[current_offset] = std::move(ctx);
+
+        current_word_offset = ih.next_image_header_offset;
+        image_count++;
+    }
+
+    return image_headers;
+}
+
+static void validate_image_header_partition_links(
+    ParsedImage& img,
+    LogCallback logger,
+    const std::unordered_map<uint32_t, ImageHeaderContext>& image_headers,
+    const std::unordered_map<uint32_t, uint32_t>& observed_partition_counts,
+    const std::unordered_set<uint32_t>& traversed_partition_header_offsets) {
+    for (const auto& [image_header_offset, ctx] : image_headers) {
+        const auto observed_it = observed_partition_counts.find(image_header_offset);
+        const uint32_t observed = observed_it == observed_partition_counts.end() ? 0 : observed_it->second;
+        if (ctx.partition_count != 0 && observed != ctx.partition_count) {
+            char msg[256] = {0};
+            std::snprintf(msg,
+                          sizeof(msg),
+                          "Image header at 0x%08X reports %u partition(s) but parser traversed %u.",
+                          image_header_offset,
+                          ctx.partition_count,
+                          observed);
+            add_warning(img, logger, msg);
+        }
+
+        if (ctx.first_partition_header_offset != 0 &&
+            ctx.first_partition_header_offset != 0xFFFFFFFF &&
+            traversed_partition_header_offsets.count(ctx.first_partition_header_offset) == 0) {
+            char msg[256] = {0};
+            std::snprintf(msg,
+                          sizeof(msg),
+                          "Image header at 0x%08X points to first partition header 0x%08X which was not traversed.",
+                          image_header_offset,
+                          ctx.first_partition_header_offset);
+            add_warning(img, logger, msg);
+        }
     }
 }
 
@@ -162,6 +525,55 @@ static bool is_a5x_family_destination_cpu(DestinationCpu destination_cpu) {
 
 static ArmBitnessHint decode_a5x_exec_state(uint32_t attributes) {
     return ((attributes >> 3) & 0x1) ? ArmBitnessHint::AArch32 : ArmBitnessHint::AArch64;
+}
+
+static PartitionChecksumType decode_zynq7000_checksum_type(uint32_t attributes) {
+    switch ((attributes >> 12) & 0x7) {
+        case 0x0:
+            return PartitionChecksumType::None;
+        case 0x1:
+            return PartitionChecksumType::Md5;
+        default:
+            return PartitionChecksumType::Other;
+    }
+}
+
+static PartitionChecksumType decode_zynqmp_checksum_type(uint32_t attributes) {
+    switch ((attributes >> 12) & 0x7) {
+        case 0x0:
+            return PartitionChecksumType::None;
+        case 0x3:
+            return PartitionChecksumType::Sha3;
+        default:
+            return PartitionChecksumType::Other;
+    }
+}
+
+static PartitionHashAlgorithm hash_algo_for_checksum_type(PartitionChecksumType checksum_type) {
+    switch (checksum_type) {
+        case PartitionChecksumType::Md5:
+            return PartitionHashAlgorithm::Md5;
+        case PartitionChecksumType::Sha3:
+            return PartitionHashAlgorithm::Sha3;
+        case PartitionChecksumType::None:
+        case PartitionChecksumType::Unknown:
+        case PartitionChecksumType::Other:
+        default:
+            return PartitionHashAlgorithm::Unknown;
+    }
+}
+
+static bool has_valid_word_offset(uint32_t value) {
+    return value != 0 && value != 0xFFFFFFFF;
+}
+
+static void add_partition_security_warning(PartitionInfo& part,
+                                           ParsedImage& img,
+                                           const std::string& warning_message) {
+    part.security_warnings.push_back(warning_message);
+
+    std::string partition_name = part.name.empty() ? "<unnamed_partition>" : part.name;
+    img.security_warnings.push_back(partition_name + ": " + warning_message);
 }
 
 static bool has_valid_exec_address(uint64_t exec_address) {
@@ -592,11 +1004,7 @@ std::string unpack_image_name(Reader& reader, uint32_t image_header_offset) {
         result.pop_back();
     }
     
-    // Sanitize
-    for (char& c : result) {
-        if (!isalnum(c) && c != '_' && c != '.') c = '_';
-    }
-    return result;
+    return sanitize_name(result);
 }
 
 static void parse_zynq7000(Reader& reader, ParsedImage& img, LogCallback logger) {
@@ -605,10 +1013,24 @@ static void parse_zynq7000(Reader& reader, ParsedImage& img, LogCallback logger)
         return;
     }
 
+    img.boot_header.present = true;
+    set_key_source_metadata(img, bh.key_source);
+    add_boot_attribute(img, "header_version", bh.header_version);
+    add_boot_attribute(img, "qspi_config_word", bh.qspi_config_word);
+    add_boot_region_diagnostic(img,
+                               reader,
+                               logger,
+                               "REGISTER_INIT",
+                               0xA0,
+                               sizeof(zynq7000::RegisterInitTable));
+
     img.bootloader_exec_address = bh.fsbl_execution_address;
     img.bootloader_load_address = bh.fsbl_load_address;
     img.bootloader_offset = bh.source_offset;
     img.bootloader_size = bh.fsbl_image_length;
+
+    add_boot_image_range(img, reader, logger, "FSBL", bh.source_offset, bh.fsbl_image_length);
+    add_boot_image_range(img, reader, logger, "FSBL_TOTAL", bh.source_offset, bh.total_fsbl_length);
 
     if (logger) {
         char msg[128] = {0};
@@ -638,14 +1060,33 @@ static void parse_zynq7000(Reader& reader, ParsedImage& img, LogCallback logger)
         return;
     }
 
+    add_boot_image_range(img,
+                         reader,
+                         logger,
+                         "IMAGE_HEADER_TABLE",
+                         actual_iht_offset,
+                         sizeof(zynq7000::ImageHeaderTable));
+
     zynq7000::ImageHeaderTable iht;
     if (!reader.read_bytes(actual_iht_offset, &iht, sizeof(iht))) {
         return;
     }
 
+    uint32_t max_images = iht.count_of_image_header;
+    if (max_images == 0 || max_images == 0xFFFFFFFF) {
+        max_images = 64;
+    }
+    const auto image_headers =
+        walk_image_header_chain<zynq7000::ImageHeader>(reader, iht.first_image_header_offset, max_images);
+    std::unordered_map<uint32_t, uint32_t> observed_partition_counts;
+    std::unordered_set<uint32_t> traversed_partition_header_offsets;
+    std::unordered_set<uint32_t> unknown_image_header_refs;
+
     uint32_t ph_offset = iht.first_partition_header_offset * 4;
     uint32_t count = 0;
     while (ph_offset != 0 && ph_offset != 0xFFFFFFFF && count < 32) {
+        traversed_partition_header_offsets.insert(ph_offset);
+
         zynq7000::PartitionHeader ph;
         if (!reader.read_bytes(ph_offset, &ph, sizeof(ph))) {
             break;
@@ -661,15 +1102,41 @@ static void parse_zynq7000(Reader& reader, ParsedImage& img, LogCallback logger)
         pinfo.exec_address = ph.destination_execution_address;
         pinfo.data_offset = ph.data_word_offset * 4;
         pinfo.data_size = ph.unencrypted_partition_length * 4;
-        pinfo.name = unpack_image_name(reader, ph.image_header_word_offset * 4);
-        if (pinfo.name.empty()) {
+        pinfo.is_encrypted = is_present_length(ph.encrypted_partition_length);
+        pinfo.has_auth_certificate = has_valid_word_offset(ph.ac_offset) || (((ph.attributes >> 15) & 0x1) != 0);
+        pinfo.checksum_type = decode_zynq7000_checksum_type(ph.attributes);
+        pinfo.hash_algo = hash_algo_for_checksum_type(pinfo.checksum_type);
+        const uint32_t image_header_offset = ph.image_header_word_offset * 4;
+        auto ctx_it = image_headers.find(image_header_offset);
+        if (ctx_it != image_headers.end() && !ctx_it->second.name.empty()) {
+            pinfo.name = ctx_it->second.name;
+            observed_partition_counts[image_header_offset]++;
+        } else {
             pinfo.name = "PART_" + std::to_string(count);
+            if (image_header_offset != 0 && image_header_offset != 0xFFFFFFFF &&
+                unknown_image_header_refs.insert(image_header_offset).second) {
+                char msg[192] = {0};
+                std::snprintf(msg,
+                              sizeof(msg),
+                              "Partition references image header 0x%08X that was not found in traversed IH chain.",
+                              image_header_offset);
+                add_warning(img, logger, msg);
+            }
+        }
+
+        if (pinfo.is_encrypted) {
+            add_partition_security_warning(pinfo,
+                                           img,
+                                           "partition marked encrypted; payload may be ciphertext and not directly executable.");
         }
 
         img.partitions.push_back(pinfo);
         ph_offset += sizeof(zynq7000::PartitionHeader);
         count++;
     }
+
+    validate_image_header_partition_links(
+        img, logger, image_headers, observed_partition_counts, traversed_partition_header_offsets);
 }
 
 static void parse_zynqmp(Reader& reader, ParsedImage& img, LogCallback logger) {
@@ -678,6 +1145,35 @@ static void parse_zynqmp(Reader& reader, ParsedImage& img, LogCallback logger) {
     zynqmp::BootHeader bh;
     if (!reader.read_bytes(0, &bh, sizeof(bh))) {
         return;
+    }
+
+    img.boot_header.present = true;
+    set_key_source_metadata(img, bh.key_source);
+    set_iv_metadata(img.boot_header.secure_header_iv,
+                    img.boot_header.secure_header_iv_present,
+                    bh.secure_header_iv,
+                    3);
+    set_iv_metadata(img.boot_header.obfuscated_black_key_iv,
+                    img.boot_header.obfuscated_black_key_iv_present,
+                    bh.obfuscated_black_key_iv,
+                    3);
+    add_boot_attribute(img, "fsbl_image_attributes", bh.fsbl_image_attributes);
+    add_boot_region_diagnostic(img,
+                               reader,
+                               logger,
+                               "REGISTER_INIT",
+                               0xB8,
+                               sizeof(zynqmp::RegisterInitTable));
+    add_boot_region_diagnostic(img,
+                               reader,
+                               logger,
+                               "PUF_HELPER_DATA",
+                               0x8B8,
+                               sizeof(zynqmp::PufHelperData));
+    if (0xB8ULL + sizeof(zynqmp::RegisterInitTable) != 0x8B8ULL) {
+        add_warning(img,
+                    logger,
+                    "ZynqMP register-init and PUF helper regions are not contiguous as expected by UG1283.");
     }
 
     img.bootloader_exec_address = bh.fsbl_execution_address;
@@ -696,6 +1192,14 @@ static void parse_zynqmp(Reader& reader, ParsedImage& img, LogCallback logger) {
         pmufw.name = "PMUFW";
         img.partitions.push_back(pmufw);
 
+        add_boot_image_range(img, reader, logger, "PMUFW", bh.source_offset, bh.pmu_image_length);
+        add_boot_image_range(img,
+                             reader,
+                             logger,
+                             "PMUFW_TOTAL",
+                             bh.source_offset,
+                             bh.total_pmu_fw_length);
+
         uint32_t pmu_prefix_length = bh.total_pmu_fw_length;
         if (!is_present_length(pmu_prefix_length)) {
             pmu_prefix_length = bh.pmu_image_length;
@@ -704,6 +1208,33 @@ static void parse_zynqmp(Reader& reader, ParsedImage& img, LogCallback logger) {
     } else {
         img.bootloader_offset = bh.source_offset;
     }
+
+    if (is_present_length(bh.fsbl_image_length)) {
+        PartitionInfo fsbl;
+        fsbl.load_address = img.bootloader_load_address;
+        fsbl.exec_address = img.bootloader_exec_address;
+        fsbl.data_offset = img.bootloader_offset;
+        fsbl.data_size = bh.fsbl_image_length;
+        fsbl.is_bootloader_partition = true;
+        fsbl.processor_family = ProcessorFamily::Arm;
+        fsbl.destination_cpu = DestinationCpu::A53_0;
+        fsbl.arm_bitness_hint = ArmBitnessHint::Unknown;
+        fsbl.name = "FSBL";
+        img.partitions.push_back(fsbl);
+    }
+
+    add_boot_image_range(img,
+                         reader,
+                         logger,
+                         "FSBL",
+                         img.bootloader_offset,
+                         bh.fsbl_image_length);
+    add_boot_image_range(img,
+                         reader,
+                         logger,
+                         "FSBL_TOTAL",
+                         img.bootloader_offset,
+                         bh.total_fsbl_length);
 
     if (logger) {
         char msg[128] = {0};
@@ -733,14 +1264,38 @@ static void parse_zynqmp(Reader& reader, ParsedImage& img, LogCallback logger) {
         return;
     }
 
+    add_boot_image_range(img,
+                         reader,
+                         logger,
+                         "IMAGE_HEADER_TABLE",
+                         actual_iht_offset,
+                         sizeof(zynqmp::ImageHeaderTable));
+
     zynqmp::ImageHeaderTable iht;
     if (!reader.read_bytes(actual_iht_offset, &iht, sizeof(iht))) {
         return;
     }
 
+    warn_if_invalid_checksum(img,
+                             logger,
+                             "ZynqMP image header table",
+                             validate_inverse_sum_checksum(reader, actual_iht_offset, actual_iht_offset + 0x3C));
+
+    uint32_t max_images = iht.count_of_image_header;
+    if (max_images == 0 || max_images == 0xFFFFFFFF) {
+        max_images = 64;
+    }
+    const auto image_headers =
+        walk_image_header_chain<zynqmp::ImageHeader>(reader, iht.first_image_header_offset, max_images);
+    std::unordered_map<uint32_t, uint32_t> observed_partition_counts;
+    std::unordered_set<uint32_t> traversed_partition_header_offsets;
+    std::unordered_set<uint32_t> unknown_image_header_refs;
+
     uint32_t ph_offset = iht.first_partition_header_offset * 4;
     uint32_t count = 0;
     while (ph_offset != 0 && ph_offset != 0xFFFFFFFF && count < 32) {
+        traversed_partition_header_offsets.insert(ph_offset);
+
         zynqmp::PartitionHeader ph;
         if (!reader.read_bytes(ph_offset, &ph, sizeof(ph))) {
             break;
@@ -756,20 +1311,47 @@ static void parse_zynqmp(Reader& reader, ParsedImage& img, LogCallback logger) {
         pinfo.exec_address = (static_cast<uint64_t>(ph.destination_execution_address_hi) << 32) | ph.destination_execution_address_lo;
         pinfo.data_offset = ph.actual_partition_word_offset * 4;
         pinfo.data_size = ph.unencrypted_data_word_length * 4;
+        pinfo.is_encrypted = (((ph.attributes >> 7) & 0x1) != 0) ||
+                             is_present_length(ph.encrypted_partition_data_word_length);
+        pinfo.has_auth_certificate = has_valid_word_offset(ph.ac_offset) || (((ph.attributes >> 15) & 0x1) != 0);
+        pinfo.checksum_type = decode_zynqmp_checksum_type(ph.attributes);
+        pinfo.hash_algo = hash_algo_for_checksum_type(pinfo.checksum_type);
         pinfo.destination_cpu = decode_zynqmp_destination_cpu(ph.attributes);
         pinfo.processor_family = processor_family_for_destination_cpu(pinfo.destination_cpu);
         if (is_a5x_family_destination_cpu(pinfo.destination_cpu)) {
             pinfo.arm_bitness_hint = decode_a5x_exec_state(ph.attributes);
         }
-        pinfo.name = unpack_image_name(reader, ph.image_header_word_offset * 4);
-        if (pinfo.name.empty()) {
+        const uint32_t image_header_offset = ph.image_header_word_offset * 4;
+        auto ctx_it = image_headers.find(image_header_offset);
+        if (ctx_it != image_headers.end() && !ctx_it->second.name.empty()) {
+            pinfo.name = ctx_it->second.name;
+            observed_partition_counts[image_header_offset]++;
+        } else {
             pinfo.name = "PART_" + std::to_string(count);
+            if (image_header_offset != 0 && image_header_offset != 0xFFFFFFFF &&
+                unknown_image_header_refs.insert(image_header_offset).second) {
+                char msg[192] = {0};
+                std::snprintf(msg,
+                              sizeof(msg),
+                              "Partition references image header 0x%08X that was not found in traversed IH chain.",
+                              image_header_offset);
+                add_warning(img, logger, msg);
+            }
+        }
+
+        if (pinfo.is_encrypted) {
+            add_partition_security_warning(pinfo,
+                                           img,
+                                           "partition marked encrypted; payload may be ciphertext and not directly executable.");
         }
 
         img.partitions.push_back(pinfo);
         ph_offset = ph.next_partition_header_offset * 4;
         count++;
     }
+
+    validate_image_header_partition_links(
+        img, logger, image_headers, observed_partition_counts, traversed_partition_header_offsets);
 }
 
 static void parse_versal_gen1(Reader& reader, ParsedImage& img, LogCallback logger) {
@@ -777,6 +1359,54 @@ static void parse_versal_gen1(Reader& reader, ParsedImage& img, LogCallback logg
     if (!reader.read_bytes(0, &bh, sizeof(bh))) {
         return;
     }
+
+    img.boot_header.present = true;
+    set_key_source_metadata(img, bh.key_source);
+    set_iv_metadata(img.boot_header.black_iv,
+                    img.boot_header.black_iv_present,
+                    bh.black_iv,
+                    3);
+    set_iv_metadata(img.boot_header.secure_header_iv,
+                    img.boot_header.secure_header_iv_present,
+                    bh.secure_header_iv,
+                    3);
+    set_iv_metadata(img.boot_header.secure_header_iv_aux,
+                    img.boot_header.secure_header_iv_aux_present,
+                    bh.secure_header_iv_pmc,
+                    3);
+    add_boot_attribute(img, "boot_attributes", bh.attributes);
+    add_boot_region_diagnostic(img,
+                               reader,
+                               logger,
+                               "REGISTER_INIT",
+                               0x128,
+                               sizeof(versal::RegisterInitTable));
+    add_boot_region_diagnostic(img,
+                               reader,
+                               logger,
+                               "PUF_HELPER_DATA",
+                               0x928,
+                               sizeof(versal::PufHelperData));
+    if (0x128ULL + sizeof(versal::RegisterInitTable) != 0x928ULL) {
+        add_warning(img,
+                    logger,
+                    "Versal register-init and PUF helper regions are not contiguous as expected by UG1283.");
+    }
+
+    add_boot_image_range(img, reader, logger, "PLM", bh.plm_source_offset, bh.plm_length);
+    add_boot_image_range(img, reader, logger, "PLM_TOTAL", bh.plm_source_offset, bh.total_plm_length);
+    add_boot_image_range(img,
+                         reader,
+                         logger,
+                         "PMC_DATA",
+                         static_cast<uint64_t>(bh.plm_source_offset) + bh.total_plm_length,
+                         bh.pmc_data_length);
+    add_boot_image_range(img,
+                         reader,
+                         logger,
+                         "PMC_DATA_TOTAL",
+                         static_cast<uint64_t>(bh.plm_source_offset) + bh.total_plm_length,
+                         bh.total_pmc_data_length);
 
     if (logger) {
         logger("Versal Gen1 Boot Header parsed. PLM Exec: 0xF0280000\n");
@@ -814,10 +1444,29 @@ static void parse_versal_gen1(Reader& reader, ParsedImage& img, LogCallback logg
         return;
     }
 
+    add_boot_image_range(img,
+                         reader,
+                         logger,
+                         "IMAGE_HEADER_TABLE",
+                         bh.meta_header_offset,
+                         sizeof(versal::ImageHeaderTable));
+
     versal::ImageHeaderTable iht;
     if (!reader.read_bytes(bh.meta_header_offset, &iht, sizeof(iht))) {
         return;
     }
+
+    warn_if_invalid_checksum(img,
+                             logger,
+                             "Versal Gen1 image header table",
+                             validate_inverse_sum_checksum(reader, bh.meta_header_offset, bh.meta_header_offset + 0x7C));
+
+    parse_versal_optional_data(reader, img, logger, iht, bh.meta_header_offset);
+
+    const auto image_contexts =
+        parse_versal_image_headers(reader, iht.image_header_offset, iht.total_number_of_images);
+    const auto partition_owner_names = build_versal_partition_owner_map(reader, image_contexts, img, logger);
+    std::unordered_set<uint32_t> unknown_owner_offsets;
 
     uint32_t ph_offset = iht.partition_header_offset * 4;
     uint32_t count = 0;
@@ -837,12 +1486,38 @@ static void parse_versal_gen1(Reader& reader, ParsedImage& img, LogCallback logg
         pinfo.exec_address = (static_cast<uint64_t>(ph.destination_execution_address_hi) << 32) | ph.destination_execution_address_lo;
         pinfo.data_offset = ph.actual_partition_word_offset * 4;
         pinfo.data_size = ph.unencrypted_data_word_length * 4;
+        pinfo.is_encrypted = has_valid_word_offset(ph.encryption_key_select);
+        pinfo.has_auth_certificate = has_valid_word_offset(ph.hash_block_ac_offset) ||
+                                     has_valid_word_offset(ph.authentication_header);
+        pinfo.checksum_type = PartitionChecksumType::Unknown;
+        pinfo.hash_algo = PartitionHashAlgorithm::Unknown;
         pinfo.destination_cpu = decode_versal_gen1_destination_cpu(ph.attributes);
         pinfo.processor_family = processor_family_for_destination_cpu(pinfo.destination_cpu);
         if (is_a5x_family_destination_cpu(pinfo.destination_cpu)) {
             pinfo.arm_bitness_hint = decode_a5x_exec_state(ph.attributes);
         }
-        pinfo.name = "PDI_PART_" + std::to_string(count);
+
+        auto owner_it = partition_owner_names.find(ph_offset);
+        if (owner_it != partition_owner_names.end() && !owner_it->second.empty()) {
+            pinfo.name = owner_it->second;
+        } else {
+            pinfo.name = "PDI_PART_" + std::to_string(count);
+            if (unknown_owner_offsets.insert(ph_offset).second) {
+                char msg[224] = {0};
+                std::snprintf(msg,
+                              sizeof(msg),
+                              "Versal partition header at 0x%08X has no owning image-header context; using fallback name '%s'.",
+                              ph_offset,
+                              pinfo.name.c_str());
+                add_warning(img, logger, msg);
+            }
+        }
+
+        if (pinfo.is_encrypted) {
+            add_partition_security_warning(pinfo,
+                                           img,
+                                           "partition encryption key selector is present; payload may be ciphertext.");
+        }
 
         img.partitions.push_back(pinfo);
         ph_offset = ph.next_partition_header_offset * 4;
@@ -881,6 +1556,11 @@ static void parse_versal_gen2(Reader& reader, ParsedImage& img, LogCallback logg
     if (probe.iht_layout_valid) {
         versal::ImageHeaderTable iht{};
         if (reader.read_bytes(probe.iht_offset, &iht, sizeof(iht))) {
+            warn_if_invalid_checksum(img,
+                                     logger,
+                                     "Versal Gen2 image header table",
+                                     validate_inverse_sum_checksum(reader, probe.iht_offset, probe.iht_offset + 0x7C));
+            parse_versal_optional_data(reader, img, logger, iht, probe.iht_offset);
             const uint32_t first_partition_header_offset = iht.partition_header_offset * 4;
             if (first_partition_header_offset != 0 && first_partition_header_offset != 0xFFFFFFFF) {
                 versal::PartitionHeader ph{};

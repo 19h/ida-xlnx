@@ -75,6 +75,11 @@ public:
 
         uint32_t count = 2;
         for (const auto& part : img.partitions) {
+            if (part.is_bootloader_partition) {
+                count++;
+                continue;
+            }
+
             ida::ui::message(" - " + part.name + ": Load=0x" + std::to_string(part.load_address) + 
                              " Size=0x" + std::to_string(part.data_size) + "\n");
                              
