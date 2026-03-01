@@ -241,7 +241,7 @@ struct VersalPartitionOwnerContext {
 
 static std::string sanitize_name(std::string value) {
     for (char& c : value) {
-        if (!isalnum(c) && c != '_' && c != '.') {
+        if (!isalnum(c) && c != '_' && c != '.' && c != '-') {
             c = '_';
         }
     }
@@ -506,13 +506,12 @@ static DestinationCpu decode_versal_gen2_destination_cpu(uint32_t attributes) {
 }
 
 static DestinationDevice decode_zynq7000_destination_device(uint32_t attributes) {
-    switch ((attributes >> 4) & 0xF) {
-        case 0x0: return DestinationDevice::None;
-        case 0x1: return DestinationDevice::PS;
-        case 0x2: return DestinationDevice::PL;
-        case 0x3: return DestinationDevice::INT;
-        default: return DestinationDevice::Unknown;
-    }
+    // Zynq-7000 attribute bits: bit[4] = PS destination, bit[5] = PL destination
+    const bool ps = ((attributes >> 4) & 0x1) != 0;
+    const bool pl = ((attributes >> 5) & 0x1) != 0;
+    if (pl) return DestinationDevice::PL;
+    if (ps) return DestinationDevice::PS;
+    return DestinationDevice::None;
 }
 
 static DestinationDevice decode_zynqmp_destination_device(uint32_t attributes) {
@@ -876,6 +875,10 @@ bool partition_is_executable_cpu(const PartitionInfo& partition) {
 
 bool partition_payload_overlaps_auth_certificate(const PartitionInfo& partition) {
     return partition.auth_certificate.present && partition.auth_certificate.offset == partition.data_offset;
+}
+
+bool is_configuration_partition_type_external(PartitionType partition_type) {
+    return is_configuration_partition_type(partition_type);
 }
 
 struct ProcessorFamilyScores {
@@ -1286,7 +1289,10 @@ static Arch classify_pdi_arch(Reader& reader, LogCallback logger) {
 std::string unpack_image_name(Reader& reader, uint32_t image_header_offset) {
     if (image_header_offset == 0 || image_header_offset == 0xFFFFFFFF) return "";
     
-    uint32_t buffer[16] = {0}; // up to 64 bytes
+    // Zynq/ZynqMP image names are stored with bytes reversed within each 32-bit word
+    // (big-endian character order in a little-endian word). We read as u32 and extract
+    // bytes in big-endian order to recover the original ASCII string.
+    uint32_t buffer[16] = {0};
     if (!reader.read_bytes(image_header_offset + 0x10, buffer, sizeof(buffer))) return "";
 
     std::string result;
@@ -1388,6 +1394,19 @@ static void parse_zynq7000(Reader& reader, ParsedImage& img, LogCallback logger)
     }
     const auto image_headers =
         walk_image_header_chain<zynq7000::ImageHeader>(reader, iht.first_image_header_offset, max_images);
+
+    // Build reverse map: partition_header_byte_offset -> (image_header_byte_offset, name)
+    // Many Zynq7000 images have PH.image_header_word_offset = 0, so we need to resolve
+    // partition names via IH.corresponding_partition_header -> PH offset linkage.
+    std::unordered_map<uint32_t, std::pair<uint32_t, std::string>> ph_to_ih_name;
+    for (const auto& [ih_offset, ctx] : image_headers) {
+        if (ctx.first_partition_header_offset != 0 &&
+            ctx.first_partition_header_offset != 0xFFFFFFFF &&
+            !ctx.name.empty()) {
+            ph_to_ih_name[ctx.first_partition_header_offset] = {ih_offset, ctx.name};
+        }
+    }
+
     std::unordered_map<uint32_t, uint32_t> observed_partition_counts;
     std::unordered_set<uint32_t> traversed_partition_header_offsets;
     std::unordered_set<uint32_t> unknown_image_header_refs;
@@ -1412,31 +1431,48 @@ static void parse_zynq7000(Reader& reader, ParsedImage& img, LogCallback logger)
         pinfo.exec_address = ph.destination_execution_address;
         pinfo.data_offset = ph.data_word_offset * 4;
         pinfo.data_size = ph.unencrypted_partition_length * 4;
-        pinfo.is_encrypted = is_present_length(ph.encrypted_partition_length);
+        // Zynq7000: encrypted if encrypted_partition_length differs from
+        // unencrypted_partition_length (both are present and non-zero when not encrypted,
+        // holding the same value; encrypted_partition_length > unencrypted_partition_length
+        // when encrypted, as it includes encryption overhead).
+        pinfo.is_encrypted = is_present_length(ph.encrypted_partition_length) &&
+                             ph.encrypted_partition_length != ph.unencrypted_partition_length;
         parse_auth_certificate_from_word_offset(reader, ph.ac_offset, pinfo.auth_certificate);
         pinfo.has_auth_certificate = pinfo.auth_certificate.present || (((ph.attributes >> 15) & 0x1) != 0);
         pinfo.checksum_type = decode_zynq7000_checksum_type(ph.attributes);
         pinfo.hash_algo = hash_algo_for_checksum_type(pinfo.checksum_type);
         apply_decoded_attributes(pinfo, decode_zynq7000_attributes(ph.attributes, pinfo.exec_address));
-        if (pinfo.destination_device == DestinationDevice::PS && has_valid_exec_address(pinfo.exec_address)) {
+        // Zynq7000 PS partitions are always ARM AArch32.
+        // Exec address 0x0 is valid (OCM base) so we don't gate on exec address.
+        if (pinfo.destination_device == DestinationDevice::PS) {
             pinfo.processor_family = ProcessorFamily::Arm;
             pinfo.arm_bitness_hint = ArmBitnessHint::AArch32;
         }
+
+        // Resolve partition name: try PH.image_header_word_offset first,
+        // then fallback to reverse IH->PH linkage (many Zynq7000 images set PH's
+        // image_header_word_offset to 0).
         const uint32_t image_header_offset = ph.image_header_word_offset * 4;
         auto ctx_it = image_headers.find(image_header_offset);
         if (ctx_it != image_headers.end() && !ctx_it->second.name.empty()) {
             pinfo.name = ctx_it->second.name;
             observed_partition_counts[image_header_offset]++;
         } else {
-            pinfo.name = "PART_" + std::to_string(count);
-            if (image_header_offset != 0 && image_header_offset != 0xFFFFFFFF &&
-                unknown_image_header_refs.insert(image_header_offset).second) {
-                char msg[192] = {0};
-                std::snprintf(msg,
-                              sizeof(msg),
-                              "Partition references image header 0x%08X that was not found in traversed IH chain.",
-                              image_header_offset);
-                add_warning(img, logger, msg);
+            auto rev_it = ph_to_ih_name.find(ph_offset);
+            if (rev_it != ph_to_ih_name.end()) {
+                pinfo.name = rev_it->second.second;
+                observed_partition_counts[rev_it->second.first]++;
+            } else {
+                pinfo.name = "PART_" + std::to_string(count);
+                if (image_header_offset != 0 && image_header_offset != 0xFFFFFFFF &&
+                    unknown_image_header_refs.insert(image_header_offset).second) {
+                    char msg[192] = {0};
+                    std::snprintf(msg,
+                                  sizeof(msg),
+                                  "Partition references image header 0x%08X that was not found in traversed IH chain.",
+                                  image_header_offset);
+                    add_warning(img, logger, msg);
+                }
             }
         }
 

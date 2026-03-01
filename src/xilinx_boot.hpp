@@ -50,19 +50,19 @@ namespace zynq7000 {
     };
     
     struct PartitionHeader {
-        uint32_t encrypted_partition_length; // 0x00
-        uint32_t unencrypted_partition_length; // 0x04
-        uint32_t total_partition_word_length;  // 0x08
-        uint32_t destination_load_address;     // 0x0C
+        uint32_t encrypted_partition_length;    // 0x00 (word count)
+        uint32_t unencrypted_partition_length;  // 0x04 (word count)
+        uint32_t total_partition_word_length;   // 0x08 (word count)
+        uint32_t destination_load_address;      // 0x0C
         uint32_t destination_execution_address; // 0x10
-        uint32_t data_word_offset;             // 0x14
-        uint32_t attributes;                   // 0x18
-        uint32_t section_count;                // 0x1C
-        uint32_t checksum_word_offset;         // 0x20
-        uint32_t image_header_word_offset;     // 0x24
-        uint32_t ac_offset;                    // 0x28
-        uint32_t reserved[4];                  // 0x2C - 0x38
-        uint32_t header_checksum;              // 0x3C
+        uint32_t data_word_offset;              // 0x14 (word offset in image)
+        uint32_t attributes;                    // 0x18
+        uint32_t section_count;                 // 0x1C
+        uint32_t checksum_word_offset;          // 0x20 (word offset)
+        uint32_t image_header_word_offset;      // 0x24 (word offset)
+        uint32_t ac_offset;                     // 0x28 (word offset)
+        uint32_t reserved[4];                   // 0x2C - 0x38
+        uint32_t header_checksum;               // 0x3C
     };
 } // namespace zynq7000
 
@@ -265,6 +265,14 @@ static_assert(offsetof(zynq7000::BootHeader, partition_header_table_offset) == 0
               "zynq7000::BootHeader::partition_header_table_offset offset mismatch");
 static_assert(offsetof(zynq7000::PartitionHeader, ac_offset) == 0x28,
               "zynq7000::PartitionHeader::ac_offset offset mismatch");
+static_assert(offsetof(zynq7000::PartitionHeader, destination_load_address) == 0x0C,
+              "zynq7000::PartitionHeader::destination_load_address offset mismatch");
+static_assert(offsetof(zynq7000::PartitionHeader, destination_execution_address) == 0x10,
+              "zynq7000::PartitionHeader::destination_execution_address offset mismatch");
+static_assert(offsetof(zynq7000::PartitionHeader, data_word_offset) == 0x14,
+              "zynq7000::PartitionHeader::data_word_offset offset mismatch");
+static_assert(offsetof(zynq7000::PartitionHeader, image_header_word_offset) == 0x24,
+              "zynq7000::PartitionHeader::image_header_word_offset offset mismatch");
 
 static_assert(sizeof(zynqmp::BootHeader) == 0xB8, "zynqmp::BootHeader size mismatch");
 static_assert(sizeof(zynqmp::RegisterInitTable) == 0x800, "zynqmp::RegisterInitTable size mismatch");

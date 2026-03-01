@@ -1,6 +1,7 @@
 #include "parser.hpp"
 #include <vector>
 #include <iostream>
+#include <fstream>
 #include <cstring>
 #include <cassert>
 #include <cstdlib>
@@ -22,6 +23,27 @@ struct MemoryReader : public Reader {
     std::vector<uint8_t> data;
     
     MemoryReader(size_t size) : data(size, 0) {}
+    
+    bool read_bytes(uint64_t offset, void* buffer, size_t size) override {
+        if (offset + size > data.size()) return false;
+        std::memcpy(buffer, data.data() + offset, size);
+        return true;
+    }
+};
+
+struct FileReader : public Reader {
+    std::vector<uint8_t> data;
+    
+    static std::optional<FileReader> open(const std::string& path) {
+        std::ifstream f(path, std::ios::binary | std::ios::ate);
+        if (!f.is_open()) return std::nullopt;
+        auto size = f.tellg();
+        f.seekg(0, std::ios::beg);
+        FileReader reader;
+        reader.data.resize(static_cast<size_t>(size));
+        f.read(reinterpret_cast<char*>(reader.data.data()), size);
+        return reader;
+    }
     
     bool read_bytes(uint64_t offset, void* buffer, size_t size) override {
         if (offset + size > data.size()) return false;
@@ -85,6 +107,8 @@ uint32_t compute_inverse_sum_checksum(const uint32_t* words, size_t count) {
 
 void test_unpack_name() {
     MemoryReader reader(128);
+    // Image names stored with bytes reversed within each u32 word (BE char order in LE word).
+    // "FSBL" -> bytes F,S,B,L -> stored as LE u32 0x4C425346 -> on-disk bytes L,B,S,F
     uint8_t packed[] = { 'L', 'B', 'S', 'F', 'E', '.', '0', '1', '\0', '\0', 'F', 'L', 0,0,0,0 };
     std::memcpy(reader.data.data() + 0x20, packed, sizeof(packed));
     
@@ -470,6 +494,7 @@ void test_zynqmp_ih_chain_name_extraction() {
     ih->corresponding_partition_header = 0x200 / 4;
     ih->partition_count = 1;
 
+    // Image names stored with bytes reversed within each u32 word (BE char order in LE word)
     uint8_t packed[] = {'L', 'B', 'S', 'F', 'E', '.', '0', '1', '\0', '\0', 'F', 'L', 0, 0, 0, 0};
     std::memcpy(reader.data.data() + 0x310, packed, sizeof(packed));
 
@@ -673,7 +698,7 @@ void test_zynq7000_partitions() {
     ph1->destination_execution_address = 0x10000000;
     ph1->data_word_offset = 0x1000 / 4;
     ph1->image_header_word_offset = 0x800 / 4;
-    ph1->attributes = (1u << 4);
+    ph1->attributes = (1u << 4); // Bit[4]=1 -> PS destination
     ph1->ac_offset = 0x300 / 4;
 
     uint32_t* ac_header = reinterpret_cast<uint32_t*>(reader.data.data() + 0x300);
@@ -687,7 +712,7 @@ void test_zynq7000_partitions() {
     ih1->corresponding_partition_header = 0x200 / 4;
     ih1->partition_count = 1;
     
-    // Set image name for PH1 at 0x800
+    // Image names stored with bytes reversed within each u32 word (BE char order in LE word)
     uint8_t packed[] = { 'L', 'B', 'S', 'F', 'E', '.', '0', '1', '\0', '\0', 'F', 'L', 0,0,0,0 };
     std::memcpy(reader.data.data() + 0x810, packed, sizeof(packed));
 
@@ -827,7 +852,107 @@ void test_versal_partitions() {
     std::cout << "[OK] versal_partitions" << std::endl;
 }
 
-int main() {
+void test_real_zynq7000_boot_bin(const std::string& path) {
+    auto reader_opt = FileReader::open(path);
+    if (!reader_opt) {
+        std::cout << "[SKIP] real_zynq7000_boot_bin: cannot open " << path << std::endl;
+        return;
+    }
+    auto& reader = *reader_opt;
+    std::cout << "[INFO] Loaded " << path << " (" << reader.data.size() << " bytes)" << std::endl;
+
+    std::vector<std::string> log_messages;
+    auto logger = [&log_messages](const std::string& msg) {
+        log_messages.push_back(msg);
+        std::cout << "  [LOG] " << msg;
+    };
+
+    auto img = parse_image(reader, logger);
+
+    // Must detect as Zynq7000 and be loadable
+    assert(img.arch == Arch::Zynq7000);
+    assert(img.load_supported);
+    assert(img.processor_name == "arm");
+    assert(img.processor_selection.family == ProcessorFamily::Arm);
+    assert(img.processor_selection.arm_bitness_hint == ArmBitnessHint::AArch32);
+
+    // Boot header metadata
+    assert(img.boot_header.present);
+    assert(img.bootloader_offset == 0x1700);
+    assert(img.bootloader_size == 0x1C010);
+    assert(img.bootloader_load_address == 0x00000000);
+    assert(img.bootloader_exec_address == 0x00000000);
+
+    // IHT says 3 images, so we expect 3 partition headers
+    std::cout << "  Partitions found: " << img.partitions.size() << std::endl;
+    for (size_t i = 0; i < img.partitions.size(); i++) {
+        const auto& p = img.partitions[i];
+        std::cout << "  [" << i << "] name=\"" << p.name << "\""
+                  << " load=0x" << std::hex << p.load_address
+                  << " exec=0x" << p.exec_address
+                  << " data_off=0x" << p.data_offset
+                  << " data_size=0x" << p.data_size
+                  << " dev=" << static_cast<int>(p.destination_device)
+                  << " type=" << static_cast<int>(p.partition_type)
+                  << " proc=" << static_cast<int>(p.processor_family)
+                  << " enc=" << p.is_encrypted
+                  << std::dec << std::endl;
+    }
+
+    assert(img.partitions.size() == 3);
+
+    // Partition 0: FSBL (Zynq7007_miner_without_rsa.elf)
+    // PH0: load=0x0, exec=0x0, data_off=0x5C0*4=0x1700, size=0x7004*4=114704
+    //   attributes=0x10 -> bit[4]=1 -> PS destination
+    const auto& p0 = img.partitions[0];
+    assert(p0.name == "Zynq7007_miner_without_rsa.elf");
+    assert(p0.load_address == 0x00000000);
+    assert(p0.exec_address == 0x00000000);
+    assert(p0.data_offset == 0x5C0 * 4);  // 0x1700
+    assert(p0.data_size == 0x7004 * 4);    // 114704 bytes
+    assert(p0.destination_device == DestinationDevice::PS);
+    assert(p0.processor_family == ProcessorFamily::Arm);
+    assert(p0.arm_bitness_hint == ArmBitnessHint::AArch32);
+    assert(!p0.is_encrypted);
+
+    // Partition 1: Bitstream (Zynq7007_miner.bit)
+    // PH1: load=0x0, exec=0x0, data_off=0x75D0*4=0x1D740, size=0x7F2E8*4=2083744
+    //   attributes=0x20 -> bit[5]=1 -> PL destination
+    const auto& p1 = img.partitions[1];
+    assert(p1.name == "Zynq7007_miner.bit");
+    assert(p1.load_address == 0x00000000);
+    assert(p1.exec_address == 0x00000000);
+    assert(p1.data_offset == 0x75D0 * 4);  // 0x1D740
+    assert(p1.data_size == 0x7F2E8 * 4);   // 2083744 bytes
+    assert(p1.destination_device == DestinationDevice::PL);
+    assert(!p1.is_encrypted);
+
+    // Partition 2: U-Boot (u-boot.elf)
+    // PH2: load=0x4000000, exec=0x4000000, data_off=0x868C0*4=0x21A300, size=0x20EDF*4=539516
+    //   attributes=0x10 -> bit[4]=1 -> PS destination
+    const auto& p2 = img.partitions[2];
+    assert(p2.name == "u-boot.elf");
+    assert(p2.load_address == 0x04000000);
+    assert(p2.exec_address == 0x04000000);
+    assert(p2.data_offset == 0x868C0 * 4);  // 0x21A300
+    assert(p2.data_size == 0x20EDF * 4);     // 539516 bytes
+    assert(p2.destination_device == DestinationDevice::PS);
+    assert(!p2.is_encrypted);
+    assert(p2.processor_family == ProcessorFamily::Arm);
+    assert(p2.arm_bitness_hint == ArmBitnessHint::AArch32);
+
+    // Print warnings for debug visibility
+    if (!img.warnings.empty()) {
+        std::cout << "  Warnings (" << img.warnings.size() << "):" << std::endl;
+        for (const auto& w : img.warnings) {
+            std::cout << "    - " << w << std::endl;
+        }
+    }
+
+    std::cout << "[OK] real_zynq7000_boot_bin" << std::endl;
+}
+
+int main(int argc, char** argv) {
     test_unpack_name();
     test_zynq7000_detection();
     test_zynqmp_detection();
@@ -844,7 +969,24 @@ int main() {
     test_zynq7000_partitions();
     test_partition_semantic_mapping_helpers();
     test_versal_partitions();
-    
+
+    // Real file tests (optional, run with path argument or default location)
+    std::string real_zynq7000_path;
+    if (argc > 1) {
+        real_zynq7000_path = argv[1];
+    } else {
+        // Default test file location
+        const char* home = std::getenv("HOME");
+        if (home) {
+            real_zynq7000_path = std::string(home) +
+                "/Downloads/hashsource_antminer_Zx-master/bitmain_firmware/"
+                "Antminer-Z15j-user-release-202012141801/fw/BOOT.bin";
+        }
+    }
+    if (!real_zynq7000_path.empty()) {
+        test_real_zynq7000_boot_bin(real_zynq7000_path);
+    }
+
     std::cout << "All headless tests passed!" << std::endl;
     return 0;
 }
