@@ -60,6 +60,10 @@ static void clear_processor_selection(ParsedImage& img) {
     img.processor_name.clear();
 }
 
+static bool is_present_length(uint32_t length) {
+    return length != 0 && length != 0xFFFFFFFF;
+}
+
 static bool has_microblaze_plm_partition(const ParsedImage& img) {
     for (const auto& part : img.partitions) {
         if (part.name == "PLM" && part.processor_family == ProcessorFamily::MicroBlaze) {
@@ -67,6 +71,285 @@ static bool has_microblaze_plm_partition(const ParsedImage& img) {
         }
     }
     return false;
+}
+
+static DestinationCpu decode_zynqmp_destination_cpu(uint32_t attributes) {
+    switch ((attributes >> 8) & 0xF) {
+        case 0x0: return DestinationCpu::None;
+        case 0x1: return DestinationCpu::A53_0;
+        case 0x2: return DestinationCpu::A53_1;
+        case 0x3: return DestinationCpu::A53_2;
+        case 0x4: return DestinationCpu::A53_3;
+        case 0x5: return DestinationCpu::R5_0;
+        case 0x6: return DestinationCpu::R5_1;
+        case 0x7: return DestinationCpu::R5_Lockstep;
+        case 0x8: return DestinationCpu::PMU;
+        default:  return DestinationCpu::Unknown;
+    }
+}
+
+static DestinationCpu decode_versal_gen1_destination_cpu(uint32_t attributes) {
+    switch ((attributes >> 8) & 0xF) {
+        case 0x0: return DestinationCpu::None;
+        case 0x1: return DestinationCpu::A72_0;
+        case 0x2: return DestinationCpu::A72_1;
+        case 0x5: return DestinationCpu::R5_0;
+        case 0x6: return DestinationCpu::R5_1;
+        case 0x7: return DestinationCpu::R5_Lockstep;
+        case 0x8: return DestinationCpu::PSM;
+        case 0x9: return DestinationCpu::AIE;
+        default:  return DestinationCpu::Unknown;
+    }
+}
+
+static DestinationCpu decode_versal_gen2_destination_cpu(uint32_t attributes) {
+    switch ((attributes >> 8) & 0xF) {
+        case 0x0: return DestinationCpu::None;
+        case 0x1: return DestinationCpu::A78_0;
+        case 0x2: return DestinationCpu::A78_1;
+        case 0x3: return DestinationCpu::A78_2;
+        case 0x4: return DestinationCpu::A78_3;
+        case 0x5: return DestinationCpu::R52_0;
+        case 0x6: return DestinationCpu::R52_1;
+        case 0x8: return DestinationCpu::ASU;
+        case 0x9: return DestinationCpu::AIE;
+        default:  return DestinationCpu::Unknown;
+    }
+}
+
+static ProcessorFamily processor_family_for_destination_cpu(DestinationCpu destination_cpu) {
+    switch (destination_cpu) {
+        case DestinationCpu::A53_0:
+        case DestinationCpu::A53_1:
+        case DestinationCpu::A53_2:
+        case DestinationCpu::A53_3:
+        case DestinationCpu::R5_0:
+        case DestinationCpu::R5_1:
+        case DestinationCpu::R5_Lockstep:
+        case DestinationCpu::A72_0:
+        case DestinationCpu::A72_1:
+        case DestinationCpu::A78_0:
+        case DestinationCpu::A78_1:
+        case DestinationCpu::A78_2:
+        case DestinationCpu::A78_3:
+        case DestinationCpu::R52_0:
+        case DestinationCpu::R52_1:
+            return ProcessorFamily::Arm;
+        case DestinationCpu::PMU:
+        case DestinationCpu::PSM:
+        case DestinationCpu::ASU:
+            return ProcessorFamily::MicroBlaze;
+        case DestinationCpu::AIE:
+        case DestinationCpu::None:
+        case DestinationCpu::Unknown:
+        default:
+            return ProcessorFamily::Unknown;
+    }
+}
+
+static bool is_a5x_family_destination_cpu(DestinationCpu destination_cpu) {
+    return destination_cpu == DestinationCpu::A53_0 ||
+           destination_cpu == DestinationCpu::A53_1 ||
+           destination_cpu == DestinationCpu::A53_2 ||
+           destination_cpu == DestinationCpu::A53_3 ||
+           destination_cpu == DestinationCpu::A72_0 ||
+           destination_cpu == DestinationCpu::A72_1 ||
+           destination_cpu == DestinationCpu::A78_0 ||
+           destination_cpu == DestinationCpu::A78_1 ||
+           destination_cpu == DestinationCpu::A78_2 ||
+           destination_cpu == DestinationCpu::A78_3;
+}
+
+static ArmBitnessHint decode_a5x_exec_state(uint32_t attributes) {
+    return ((attributes >> 3) & 0x1) ? ArmBitnessHint::AArch32 : ArmBitnessHint::AArch64;
+}
+
+static bool has_valid_exec_address(uint64_t exec_address) {
+    return exec_address != 0 && exec_address != 0xFFFFFFFFULL;
+}
+
+struct ProcessorFamilyScores {
+    int arm = 0;
+    int microblaze = 0;
+};
+
+static bool is_known_processor_family(ProcessorFamily family) {
+    return family == ProcessorFamily::Arm || family == ProcessorFamily::MicroBlaze;
+}
+
+enum class ChecksumStatus {
+    NotPresent,
+    Valid,
+    Invalid,
+};
+
+static ChecksumStatus validate_inverse_sum_checksum(Reader& reader,
+                                                    uint32_t start_offset,
+                                                    uint32_t checksum_offset) {
+    if (checksum_offset < start_offset || ((checksum_offset - start_offset) % 4) != 0) {
+        return ChecksumStatus::NotPresent;
+    }
+
+    uint32_t checksum_word = 0;
+    if (!reader.read_bytes(checksum_offset, &checksum_word, sizeof(checksum_word))) {
+        return ChecksumStatus::NotPresent;
+    }
+    if (checksum_word == 0 || checksum_word == 0xFFFFFFFF) {
+        return ChecksumStatus::NotPresent;
+    }
+
+    uint32_t sum = 0;
+    for (uint32_t off = start_offset; off < checksum_offset; off += 4) {
+        uint32_t word = 0;
+        if (!reader.read_bytes(off, &word, sizeof(word))) {
+            return ChecksumStatus::NotPresent;
+        }
+        sum += word;
+    }
+
+    const uint32_t inverse_sum = ~sum;
+    const uint32_t negated_sum = static_cast<uint32_t>(0u - sum);
+    if (checksum_word == inverse_sum || checksum_word == negated_sum) {
+        return ChecksumStatus::Valid;
+    }
+    return ChecksumStatus::Invalid;
+}
+
+static void warn_if_invalid_checksum(ParsedImage& img,
+                                     LogCallback logger,
+                                     const std::string& label,
+                                     ChecksumStatus status) {
+    if (status == ChecksumStatus::Invalid) {
+        add_warning(img, logger, label + " checksum mismatch; parser continues in degraded-trust mode.");
+    }
+}
+
+static void add_score(ProcessorFamilyScores& scores, ProcessorFamily family, int score) {
+    if (family == ProcessorFamily::Arm) {
+        scores.arm += score;
+    } else if (family == ProcessorFamily::MicroBlaze) {
+        scores.microblaze += score;
+    }
+}
+
+static ArmBitnessHint derive_arm_bitness_hint_from_partitions(const ParsedImage& img,
+                                                               ArmBitnessHint fallback) {
+    for (const auto& part : img.partitions) {
+        if (part.processor_family == ProcessorFamily::Arm &&
+            part.arm_bitness_hint != ArmBitnessHint::Unknown) {
+            return part.arm_bitness_hint;
+        }
+    }
+    return fallback;
+}
+
+static void apply_mixed_cpu_policy(ParsedImage& img, LogCallback logger) {
+    if (!img.load_supported) {
+        return;
+    }
+
+    ProcessorFamilyScores scores;
+
+    if (img.arch == Arch::Zynq7000 || img.arch == Arch::ZynqMP) {
+        add_score(scores, ProcessorFamily::Arm, 3);
+    } else if (img.arch == Arch::VersalGen1 && has_microblaze_plm_partition(img)) {
+        add_score(scores, ProcessorFamily::MicroBlaze, 3);
+    }
+
+    add_score(scores, img.processor_selection.family, 1);
+
+    for (const auto& part : img.partitions) {
+        if (!is_known_processor_family(part.processor_family)) {
+            continue;
+        }
+
+        int part_score = 1;
+        if (has_valid_exec_address(part.exec_address)) {
+            part_score += 1;
+        }
+        add_score(scores, part.processor_family, part_score);
+    }
+
+    if (scores.arm == 0 && scores.microblaze == 0) {
+        return;
+    }
+
+    ProcessorFamily selected_family = ProcessorFamily::Unknown;
+    if (scores.arm > scores.microblaze) {
+        selected_family = ProcessorFamily::Arm;
+    } else if (scores.microblaze > scores.arm) {
+        selected_family = ProcessorFamily::MicroBlaze;
+    } else {
+        switch (img.arch) {
+            case Arch::VersalGen1:
+                selected_family = ProcessorFamily::MicroBlaze;
+                break;
+            case Arch::Zynq7000:
+            case Arch::ZynqMP:
+                selected_family = ProcessorFamily::Arm;
+                break;
+            default:
+                selected_family = is_known_processor_family(img.processor_selection.family)
+                                      ? img.processor_selection.family
+                                      : ProcessorFamily::Arm;
+                break;
+        }
+    }
+
+    const bool mixed_candidates_present = scores.arm > 0 && scores.microblaze > 0;
+    if (mixed_candidates_present) {
+        char source_msg[80] = {0};
+        std::snprintf(source_msg,
+                      sizeof(source_msg),
+                      "mixed_policy:arm=%d,mblaze=%d",
+                      scores.arm,
+                      scores.microblaze);
+
+        ArmBitnessHint arm_bitness_hint = ArmBitnessHint::Unknown;
+        if (selected_family == ProcessorFamily::Arm) {
+            arm_bitness_hint = derive_arm_bitness_hint_from_partitions(img, img.processor_selection.arm_bitness_hint);
+            if (arm_bitness_hint == ArmBitnessHint::Unknown && img.arch == Arch::Zynq7000) {
+                arm_bitness_hint = ArmBitnessHint::AArch32;
+            }
+        }
+
+        set_processor_selection(img,
+                                selected_family,
+                                arm_bitness_hint,
+                                ProcessorInferenceConfidence::Medium,
+                                source_msg);
+    }
+
+    size_t mismatched_executable_partitions = 0;
+    std::string first_mismatch_name;
+
+    for (const auto& part : img.partitions) {
+        if (!has_valid_exec_address(part.exec_address)) {
+            continue;
+        }
+        if (!is_known_processor_family(part.processor_family)) {
+            continue;
+        }
+        if (part.processor_family == img.processor_selection.family) {
+            continue;
+        }
+        mismatched_executable_partitions++;
+        if (first_mismatch_name.empty()) {
+            first_mismatch_name = part.name;
+        }
+    }
+
+    if (mismatched_executable_partitions > 0) {
+        const char* selected_name = ida_processor_name_for_family(img.processor_selection.family);
+        char warning_msg[256] = {0};
+        std::snprintf(warning_msg,
+                      sizeof(warning_msg),
+                      "Mixed-CPU image: selected processor '%s' cannot represent %zu executable partition(s); example '%s'.",
+                      selected_name,
+                      mismatched_executable_partitions,
+                      first_mismatch_name.empty() ? "unknown" : first_mismatch_name.c_str());
+        add_warning(img, logger, warning_msg);
+    }
 }
 
 static bool read_u32_at(Reader& reader, uint32_t offset, uint32_t& value) {
@@ -334,6 +617,11 @@ static void parse_zynq7000(Reader& reader, ParsedImage& img, LogCallback logger)
         logger(msg);
     }
 
+    warn_if_invalid_checksum(img,
+                             logger,
+                             "Zynq7000 boot header",
+                             validate_inverse_sum_checksum(reader, 0x20, 0x48));
+
     uint32_t iht_offset = bh.image_header_table_offset;
     uint32_t version = reader.read_u32(iht_offset);
     uint32_t actual_iht_offset = 0;
@@ -385,6 +673,8 @@ static void parse_zynq7000(Reader& reader, ParsedImage& img, LogCallback logger)
 }
 
 static void parse_zynqmp(Reader& reader, ParsedImage& img, LogCallback logger) {
+    static constexpr uint64_t kZynqmpPmuRamBase = 0xFFDC0000ULL;
+
     zynqmp::BootHeader bh;
     if (!reader.read_bytes(0, &bh, sizeof(bh))) {
         return;
@@ -392,8 +682,28 @@ static void parse_zynqmp(Reader& reader, ParsedImage& img, LogCallback logger) {
 
     img.bootloader_exec_address = bh.fsbl_execution_address;
     img.bootloader_load_address = bh.fsbl_execution_address;
-    img.bootloader_offset = bh.source_offset;
     img.bootloader_size = bh.fsbl_image_length;
+
+    if (is_present_length(bh.pmu_image_length)) {
+        PartitionInfo pmufw;
+        pmufw.load_address = kZynqmpPmuRamBase;
+        pmufw.exec_address = 0;
+        pmufw.data_offset = bh.source_offset;
+        pmufw.data_size = bh.pmu_image_length;
+        pmufw.processor_family = ProcessorFamily::MicroBlaze;
+        pmufw.destination_cpu = DestinationCpu::PMU;
+        pmufw.arm_bitness_hint = ArmBitnessHint::Unknown;
+        pmufw.name = "PMUFW";
+        img.partitions.push_back(pmufw);
+
+        uint32_t pmu_prefix_length = bh.total_pmu_fw_length;
+        if (!is_present_length(pmu_prefix_length)) {
+            pmu_prefix_length = bh.pmu_image_length;
+        }
+        img.bootloader_offset = static_cast<uint64_t>(bh.source_offset) + pmu_prefix_length;
+    } else {
+        img.bootloader_offset = bh.source_offset;
+    }
 
     if (logger) {
         char msg[128] = {0};
@@ -401,6 +711,11 @@ static void parse_zynqmp(Reader& reader, ParsedImage& img, LogCallback logger) {
                       static_cast<unsigned int>(img.bootloader_exec_address));
         logger(msg);
     }
+
+    warn_if_invalid_checksum(img,
+                             logger,
+                             "ZynqMP boot header",
+                             validate_inverse_sum_checksum(reader, 0x20, 0x48));
 
     uint32_t iht_offset = bh.image_header_table_offset;
     uint32_t version = reader.read_u32(iht_offset);
@@ -441,6 +756,11 @@ static void parse_zynqmp(Reader& reader, ParsedImage& img, LogCallback logger) {
         pinfo.exec_address = (static_cast<uint64_t>(ph.destination_execution_address_hi) << 32) | ph.destination_execution_address_lo;
         pinfo.data_offset = ph.actual_partition_word_offset * 4;
         pinfo.data_size = ph.unencrypted_data_word_length * 4;
+        pinfo.destination_cpu = decode_zynqmp_destination_cpu(ph.attributes);
+        pinfo.processor_family = processor_family_for_destination_cpu(pinfo.destination_cpu);
+        if (is_a5x_family_destination_cpu(pinfo.destination_cpu)) {
+            pinfo.arm_bitness_hint = decode_a5x_exec_state(ph.attributes);
+        }
         pinfo.name = unpack_image_name(reader, ph.image_header_word_offset * 4);
         if (pinfo.name.empty()) {
             pinfo.name = "PART_" + std::to_string(count);
@@ -462,6 +782,11 @@ static void parse_versal_gen1(Reader& reader, ParsedImage& img, LogCallback logg
         logger("Versal Gen1 Boot Header parsed. PLM Exec: 0xF0280000\n");
     }
 
+    warn_if_invalid_checksum(img,
+                             logger,
+                             "Versal Gen1 boot header",
+                             validate_inverse_sum_checksum(reader, 0x10, 0xF30));
+
     if (bh.plm_length > 0 && bh.plm_length != 0xFFFFFFFF) {
         PartitionInfo plm;
         plm.load_address = 0xF0280000;
@@ -469,6 +794,8 @@ static void parse_versal_gen1(Reader& reader, ParsedImage& img, LogCallback logg
         plm.data_offset = bh.plm_source_offset;
         plm.data_size = bh.plm_length;
         plm.processor_family = ProcessorFamily::MicroBlaze;
+        plm.destination_cpu = DestinationCpu::PSM;
+        plm.arm_bitness_hint = ArmBitnessHint::Unknown;
         plm.name = "PLM";
         img.partitions.push_back(plm);
     }
@@ -510,6 +837,11 @@ static void parse_versal_gen1(Reader& reader, ParsedImage& img, LogCallback logg
         pinfo.exec_address = (static_cast<uint64_t>(ph.destination_execution_address_hi) << 32) | ph.destination_execution_address_lo;
         pinfo.data_offset = ph.actual_partition_word_offset * 4;
         pinfo.data_size = ph.unencrypted_data_word_length * 4;
+        pinfo.destination_cpu = decode_versal_gen1_destination_cpu(ph.attributes);
+        pinfo.processor_family = processor_family_for_destination_cpu(pinfo.destination_cpu);
+        if (is_a5x_family_destination_cpu(pinfo.destination_cpu)) {
+            pinfo.arm_bitness_hint = decode_a5x_exec_state(ph.attributes);
+        }
         pinfo.name = "PDI_PART_" + std::to_string(count);
 
         img.partitions.push_back(pinfo);
@@ -519,12 +851,15 @@ static void parse_versal_gen1(Reader& reader, ParsedImage& img, LogCallback logg
 }
 
 static void parse_spartan(Reader& reader, ParsedImage& img, LogCallback logger) {
-    (void)img;
-
     uint32_t source_offset = 0;
     uint32_t plm_length = 0;
     read_u32_at(reader, 0x1C, source_offset);
     read_u32_at(reader, 0x2C, plm_length);
+
+    warn_if_invalid_checksum(img,
+                             logger,
+                             "Spartan boot header",
+                             validate_inverse_sum_checksum(reader, 0x10, 0x33C));
 
     if (logger) {
         char msg[192] = {0};
@@ -536,15 +871,33 @@ static void parse_spartan(Reader& reader, ParsedImage& img, LogCallback logger) 
 }
 
 static void parse_versal_gen2(Reader& reader, ParsedImage& img, LogCallback logger) {
-    (void)img;
-
     VersalGen2Probe probe = probe_versal_gen2(reader);
+
+    warn_if_invalid_checksum(img,
+                             logger,
+                             "Versal Gen2 boot header",
+                             validate_inverse_sum_checksum(reader, 0x10, 0x113C));
+    DestinationCpu first_partition_cpu = DestinationCpu::Unknown;
+    if (probe.iht_layout_valid) {
+        versal::ImageHeaderTable iht{};
+        if (reader.read_bytes(probe.iht_offset, &iht, sizeof(iht))) {
+            const uint32_t first_partition_header_offset = iht.partition_header_offset * 4;
+            if (first_partition_header_offset != 0 && first_partition_header_offset != 0xFFFFFFFF) {
+                versal::PartitionHeader ph{};
+                if (reader.read_bytes(first_partition_header_offset, &ph, sizeof(ph))) {
+                    first_partition_cpu = decode_versal_gen2_destination_cpu(ph.attributes);
+                }
+            }
+        }
+    }
+
     if (logger) {
-        char msg[192] = {0};
+        char msg[224] = {0};
         std::snprintf(msg, sizeof(msg),
-                      "Versal Gen2 parse entry point reached (iht_valid=%u, iht_offset=0x%08X). Detailed partition parsing pending.\n",
+                      "Versal Gen2 parse entry point reached (iht_valid=%u, iht_offset=0x%08X, first_dest_cpu=%u). Detailed partition parsing pending.\n",
                       probe.iht_layout_valid ? 1U : 0U,
-                      probe.iht_offset);
+                      probe.iht_offset,
+                      static_cast<unsigned int>(first_partition_cpu));
         logger(msg);
     }
 }
@@ -623,6 +976,8 @@ ParsedImage parse_image(Reader& reader, LogCallback logger) {
         default:
             break;
     }
+
+    apply_mixed_cpu_policy(img, logger);
 
     if (!img.load_supported) {
         clear_processor_selection(img);

@@ -66,6 +66,35 @@ void test_zynqmp_detection() {
     std::cout << "[OK] zynqmp_detection" << std::endl;
 }
 
+void test_zynqmp_pmufw_prefix() {
+    MemoryReader reader(4096);
+
+    auto* bh = reinterpret_cast<zynqmp::BootHeader*>(reader.data.data());
+    bh->width_detection_word = 0xAA995566;
+    bh->header_signature = 0x584C4E58;
+    bh->fsbl_execution_address = 0x08000000;
+    bh->source_offset = 0x400;
+    bh->pmu_image_length = 0x80;
+    bh->total_pmu_fw_length = 0xA0;
+    bh->fsbl_image_length = 0x200;
+
+    auto img = parse_image(reader);
+    assert(img.arch == Arch::ZynqMP);
+    assert(img.load_supported);
+    assert(img.bootloader_offset == 0x4A0);
+    assert(img.bootloader_size == 0x200);
+    assert(!img.partitions.empty());
+    assert(img.partitions[0].name == "PMUFW");
+    assert(img.partitions[0].processor_family == ProcessorFamily::MicroBlaze);
+    assert(img.partitions[0].destination_cpu == DestinationCpu::PMU);
+    assert(img.partitions[0].arm_bitness_hint == ArmBitnessHint::Unknown);
+    assert(img.partitions[0].load_address == 0xFFDC0000ULL);
+    assert(img.partitions[0].data_offset == 0x400);
+    assert(img.partitions[0].data_size == 0x80);
+
+    std::cout << "[OK] zynqmp_pmufw_prefix" << std::endl;
+}
+
 void test_versal_detection() {
     MemoryReader reader(8192);
     auto write_u32 = [&](size_t off, uint32_t value) {
@@ -98,6 +127,51 @@ void test_versal_detection() {
     assert(img.processor_selection.confidence == ProcessorInferenceConfidence::High);
     assert(img.processor_selection.source == "partition_context:versal_plm_ppu_microblaze_default");
     std::cout << "[OK] versal_detection" << std::endl;
+}
+
+void test_zynqmp_partition_attr_decode() {
+    MemoryReader reader(4096);
+
+    auto* bh = reinterpret_cast<zynqmp::BootHeader*>(reader.data.data());
+    bh->width_detection_word = 0xAA995566;
+    bh->header_signature = 0x584C4E58;
+    bh->fsbl_execution_address = 0x08000000;
+    bh->source_offset = 0x400;
+    bh->pmu_image_length = 0;
+    bh->fsbl_image_length = 0x100;
+    bh->image_header_table_offset = 0x100;
+
+    auto* iht = reinterpret_cast<zynqmp::ImageHeaderTable*>(reader.data.data() + 0x100);
+    iht->version = 0x01010000;
+    iht->first_partition_header_offset = 0x200 / 4;
+
+    auto* ph1 = reinterpret_cast<zynqmp::PartitionHeader*>(reader.data.data() + 0x200);
+    ph1->unencrypted_data_word_length = 0x10;
+    ph1->total_partition_word_length = 0x10;
+    ph1->next_partition_header_offset = 0x240 / 4;
+    ph1->actual_partition_word_offset = 0x300 / 4;
+    ph1->attributes = (8u << 8); // PMU
+
+    auto* ph2 = reinterpret_cast<zynqmp::PartitionHeader*>(reader.data.data() + 0x240);
+    ph2->unencrypted_data_word_length = 0x10;
+    ph2->total_partition_word_length = 0x10;
+    ph2->next_partition_header_offset = 0;
+    ph2->actual_partition_word_offset = 0x340 / 4;
+    ph2->attributes = (2u << 8) | (1u << 3); // A53-1, AArch32
+
+    auto img = parse_image(reader);
+    assert(img.arch == Arch::ZynqMP);
+    assert(img.partitions.size() == 2);
+    assert(img.processor_selection.family == ProcessorFamily::Arm);
+    assert(img.processor_selection.source.find("mixed_policy:") == 0);
+    assert(img.partitions[0].destination_cpu == DestinationCpu::PMU);
+    assert(img.partitions[0].processor_family == ProcessorFamily::MicroBlaze);
+    assert(img.partitions[0].arm_bitness_hint == ArmBitnessHint::Unknown);
+    assert(img.partitions[1].destination_cpu == DestinationCpu::A53_1);
+    assert(img.partitions[1].processor_family == ProcessorFamily::Arm);
+    assert(img.partitions[1].arm_bitness_hint == ArmBitnessHint::AArch32);
+
+    std::cout << "[OK] zynqmp_partition_attr_decode" << std::endl;
 }
 
 void test_spartan_detection() {
@@ -252,6 +326,7 @@ void test_versal_partitions() {
     ph1->destination_execution_address_lo = 0xDDDDDDDD;
     ph1->destination_execution_address_hi = 0xCCCCCCCC;
     ph1->actual_partition_word_offset = 0x800 / 4;
+    ph1->attributes = (2u << 8) | (1u << 3); // A72-1, AArch32
     ph1->next_partition_header_offset = 0; // End of list
     
     auto img = parse_image(reader);
@@ -259,6 +334,9 @@ void test_versal_partitions() {
     assert(img.load_supported);
     assert(img.processor_name == "mblaze");
     assert(img.processor_selection.family == ProcessorFamily::MicroBlaze);
+    assert(img.processor_selection.source.find("mixed_policy:") == 0);
+    assert(!img.warnings.empty());
+    assert(img.warnings[0].find("Mixed-CPU image:") == 0);
     assert(img.partitions.size() == 3); // PLM + PMC + Partition
     
     assert(img.partitions[0].name == "PLM");
@@ -272,6 +350,9 @@ void test_versal_partitions() {
     assert(img.partitions[1].data_offset == 0x1000 + 0x2100);
     
     assert(img.partitions[2].name == "PDI_PART_0");
+    assert(img.partitions[2].destination_cpu == DestinationCpu::A72_1);
+    assert(img.partitions[2].processor_family == ProcessorFamily::Arm);
+    assert(img.partitions[2].arm_bitness_hint == ArmBitnessHint::AArch32);
     assert(img.partitions[2].load_address == 0xAAAAAAAABBBBBBBBULL);
     assert(img.partitions[2].exec_address == 0xCCCCCCCCDDDDDDDDULL);
     assert(img.partitions[2].data_size == 0x400);
@@ -283,6 +364,8 @@ int main() {
     test_unpack_name();
     test_zynq7000_detection();
     test_zynqmp_detection();
+    test_zynqmp_pmufw_prefix();
+    test_zynqmp_partition_attr_decode();
     test_versal_detection();
     test_spartan_detection();
     test_versal_gen2_detection();

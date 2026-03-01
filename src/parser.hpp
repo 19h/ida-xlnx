@@ -28,6 +28,30 @@ enum class ProcessorInferenceConfidence {
     High,
 };
 
+enum class DestinationCpu {
+    Unknown,
+    None,
+    A53_0,
+    A53_1,
+    A53_2,
+    A53_3,
+    R5_0,
+    R5_1,
+    R5_Lockstep,
+    PMU,
+    A72_0,
+    A72_1,
+    PSM,
+    AIE,
+    A78_0,
+    A78_1,
+    A78_2,
+    A78_3,
+    R52_0,
+    R52_1,
+    ASU,
+};
+
 struct ProcessorSelection {
     ProcessorFamily family = ProcessorFamily::Unknown;
     ArmBitnessHint arm_bitness_hint = ArmBitnessHint::Unknown;
@@ -41,6 +65,8 @@ struct PartitionInfo {
     uint64_t data_offset = 0;
     uint64_t data_size = 0;
     ProcessorFamily processor_family = ProcessorFamily::Unknown;
+    DestinationCpu destination_cpu = DestinationCpu::Unknown;
+    ArmBitnessHint arm_bitness_hint = ArmBitnessHint::Unknown;
     std::string name;
 };
 
