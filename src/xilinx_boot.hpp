@@ -137,6 +137,14 @@ namespace zynqmp {
 } // namespace zynqmp
 
 namespace versal {
+    struct RegisterInitTable {
+        uint8_t data[0x800]; // 0x128 - 0x927
+    };
+
+    struct PufHelperData {
+        uint8_t data[0x608]; // 0x928 - 0xF2F
+    };
+
     struct BootHeader {
         uint32_t smap_bus_width[4];    // 0x00
         uint32_t width_detection_word; // 0x10
@@ -157,14 +165,10 @@ namespace versal {
         uint32_t reserved1[17];        // 0x80
         uint32_t meta_header_offset;   // 0xC4
         uint32_t reserved2[24];        // 0xC8 - 0x124
-    };
-
-    struct RegisterInitTable {
-        uint8_t data[0x800]; // 0x128 - 0x927
-    };
-
-    struct PufHelperData {
-        uint8_t data[0x608]; // 0x928 - 0xF2F
+        RegisterInitTable register_init_table; // 0x128 - 0x927
+        PufHelperData puf_helper_data;         // 0x928 - 0xF2F
+        uint32_t boot_header_checksum;         // 0xF30
+        uint8_t sha3_padding[0x4C];            // 0xF34 - 0xF7F
     };
     
     struct ImageHeaderTable {
@@ -196,6 +200,11 @@ namespace versal {
         uint32_t actual_hash_block_sig_size; // 0x74
         uint32_t reserved3;             // 0x78
         uint32_t checksum;              // 0x7C
+    };
+
+    struct OptionalDataHeader {
+        uint16_t id;         // 0x00
+        uint16_t size_words; // 0x02
     };
 
     struct ImageHeader {
@@ -267,14 +276,23 @@ static_assert(offsetof(zynqmp::BootHeader, secure_header_iv) == 0xA0,
 static_assert(offsetof(zynqmp::PartitionHeader, ac_offset) == 0x34,
               "zynqmp::PartitionHeader::ac_offset offset mismatch");
 
-static_assert(sizeof(versal::BootHeader) == 0x128, "versal::BootHeader size mismatch");
+static_assert(sizeof(versal::BootHeader) == 0xF80, "versal::BootHeader size mismatch");
 static_assert(sizeof(versal::RegisterInitTable) == 0x800, "versal::RegisterInitTable size mismatch");
 static_assert(sizeof(versal::PufHelperData) == 0x608, "versal::PufHelperData size mismatch");
 static_assert(sizeof(versal::ImageHeaderTable) == 0x80, "versal::ImageHeaderTable size mismatch");
+static_assert(sizeof(versal::OptionalDataHeader) == 0x4, "versal::OptionalDataHeader size mismatch");
 static_assert(sizeof(versal::ImageHeader) == 0x40, "versal::ImageHeader size mismatch");
 static_assert(sizeof(versal::PartitionHeader) == 0x80, "versal::PartitionHeader size mismatch");
 static_assert(offsetof(versal::BootHeader, meta_header_offset) == 0xC4,
               "versal::BootHeader::meta_header_offset offset mismatch");
+static_assert(offsetof(versal::BootHeader, register_init_table) == 0x128,
+              "versal::BootHeader::register_init_table offset mismatch");
+static_assert(offsetof(versal::BootHeader, puf_helper_data) == 0x928,
+              "versal::BootHeader::puf_helper_data offset mismatch");
+static_assert(offsetof(versal::BootHeader, boot_header_checksum) == 0xF30,
+              "versal::BootHeader::boot_header_checksum offset mismatch");
+static_assert(offsetof(versal::BootHeader, sha3_padding) == 0xF34,
+              "versal::BootHeader::sha3_padding offset mismatch");
 static_assert(offsetof(versal::PartitionHeader, hash_block_ac_offset) == 0x34,
               "versal::PartitionHeader::hash_block_ac_offset offset mismatch");
 static_assert(offsetof(versal::PartitionHeader, encryption_key_select) == 0x44,

@@ -167,15 +167,15 @@ static void parse_versal_optional_data(Reader& reader,
     uint32_t consumed_words = 0;
 
     while (consumed_words < total_optional_words) {
-        uint32_t header_word = 0;
-        if (!reader.read_bytes(cursor, &header_word, sizeof(header_word))) {
+        versal::OptionalDataHeader optional_header{};
+        if (!reader.read_bytes(cursor, &optional_header, sizeof(optional_header))) {
             add_warning(img, logger, "Optional data parsing stopped: failed to read optional-data entry header.");
             break;
         }
 
         OptionalDataEntry entry;
-        entry.id = static_cast<uint16_t>(header_word & 0xFFFF);
-        entry.size_words = static_cast<uint16_t>((header_word >> 16) & 0xFFFF);
+        entry.id = optional_header.id;
+        entry.size_words = optional_header.size_words;
         entry.offset = cursor;
 
         if (entry.size_words == 0) {
@@ -1679,8 +1679,9 @@ static void parse_zynqmp(Reader& reader, ParsedImage& img, LogCallback logger) {
 }
 
 static void parse_versal_gen1(Reader& reader, ParsedImage& img, LogCallback logger) {
-    versal::BootHeader bh;
-    if (!reader.read_bytes(0, &bh, sizeof(bh))) {
+    versal::BootHeader bh{};
+    constexpr size_t kVersalBootHeaderPrefixSize = offsetof(versal::BootHeader, register_init_table);
+    if (!reader.read_bytes(0, &bh, kVersalBootHeaderPrefixSize)) {
         return;
     }
 
