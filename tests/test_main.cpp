@@ -3,8 +3,20 @@
 #include <iostream>
 #include <cstring>
 #include <cassert>
+#include <cstdlib>
 
 using namespace xilinx;
+
+[[noreturn]] static void test_assert_fail(const char* expr, const char* file, int line) {
+    std::cerr << "[FAIL] Assertion failed: " << expr << " at " << file << ":" << line << std::endl;
+    std::abort();
+}
+
+#ifdef assert
+#undef assert
+#endif
+
+#define assert(expr) ((expr) ? static_cast<void>(0) : test_assert_fail(#expr, __FILE__, __LINE__))
 
 struct MemoryReader : public Reader {
     std::vector<uint8_t> data;
@@ -63,12 +75,20 @@ bool has_warning_substring(const ParsedImage& img, const std::string& needle) {
     return false;
 }
 
+uint32_t compute_inverse_sum_checksum(const uint32_t* words, size_t count) {
+    uint32_t sum = 0;
+    for (size_t i = 0; i < count; ++i) {
+        sum += words[i];
+    }
+    return ~sum;
+}
+
 void test_unpack_name() {
     MemoryReader reader(128);
     uint8_t packed[] = { 'L', 'B', 'S', 'F', 'E', '.', '0', '1', '\0', '\0', 'F', 'L', 0,0,0,0 };
-    std::memcpy(reader.data.data() + 0x10, packed, sizeof(packed));
+    std::memcpy(reader.data.data() + 0x20, packed, sizeof(packed));
     
-    std::string name = unpack_image_name(reader, 0);
+    std::string name = unpack_image_name(reader, 0x10);
     assert(name == "FSBL10.ELF");
     std::cout << "[OK] unpack_name" << std::endl;
 }
@@ -397,6 +417,129 @@ void test_zynqmp_iht_checksum_warning() {
     std::cout << "[OK] zynqmp_iht_checksum_warning" << std::endl;
 }
 
+void test_zynqmp_iht_checksum_valid() {
+    MemoryReader reader(4096);
+
+    auto* bh = reinterpret_cast<zynqmp::BootHeader*>(reader.data.data());
+    bh->width_detection_word = 0xAA995566;
+    bh->header_signature = 0x584C4E58;
+    bh->fsbl_execution_address = 0x08000000;
+    bh->source_offset = 0x400;
+    bh->fsbl_image_length = 0x100;
+    bh->image_header_table_offset = 0x100;
+
+    auto* iht = reinterpret_cast<zynqmp::ImageHeaderTable*>(reader.data.data() + 0x100);
+    iht->version = 0x01010000;
+    iht->first_partition_header_offset = 0x200 / 4;
+
+    auto* ph = reinterpret_cast<zynqmp::PartitionHeader*>(reader.data.data() + 0x200);
+    ph->unencrypted_data_word_length = 0x10;
+    ph->total_partition_word_length = 0x10;
+    ph->next_partition_header_offset = 0;
+    ph->actual_partition_word_offset = 0x300 / 4;
+
+    auto* iht_words = reinterpret_cast<uint32_t*>(reader.data.data() + 0x100);
+    iht->checksum = compute_inverse_sum_checksum(iht_words, 15);
+
+    auto img = parse_image(reader);
+    assert(img.arch == Arch::ZynqMP);
+    assert(img.load_supported);
+    assert(!has_warning_substring(img, "ZynqMP image header table checksum mismatch"));
+
+    std::cout << "[OK] zynqmp_iht_checksum_valid" << std::endl;
+}
+
+void test_zynqmp_ih_chain_name_extraction() {
+    MemoryReader reader(8192);
+    auto* bh = reinterpret_cast<zynqmp::BootHeader*>(reader.data.data());
+    bh->width_detection_word = 0xAA995566;
+    bh->header_signature = 0x584C4E58;
+    bh->fsbl_execution_address = 0x08000000;
+    bh->source_offset = 0x400;
+    bh->fsbl_image_length = 0x20;
+    bh->image_header_table_offset = 0x100;
+
+    auto* iht = reinterpret_cast<zynqmp::ImageHeaderTable*>(reader.data.data() + 0x100);
+    iht->version = 0x01010000;
+    iht->count_of_image_header = 1;
+    iht->first_partition_header_offset = 0x200 / 4;
+    iht->first_image_header_offset = 0x300 / 4;
+
+    auto* ih = reinterpret_cast<zynqmp::ImageHeader*>(reader.data.data() + 0x300);
+    ih->next_image_header_offset = 0;
+    ih->corresponding_partition_header = 0x200 / 4;
+    ih->partition_count = 1;
+
+    uint8_t packed[] = {'L', 'B', 'S', 'F', 'E', '.', '0', '1', '\0', '\0', 'F', 'L', 0, 0, 0, 0};
+    std::memcpy(reader.data.data() + 0x310, packed, sizeof(packed));
+
+    auto* ph = reinterpret_cast<zynqmp::PartitionHeader*>(reader.data.data() + 0x200);
+    ph->unencrypted_data_word_length = 0x10;
+    ph->total_partition_word_length = 0x10;
+    ph->next_partition_header_offset = 0;
+    ph->destination_execution_address_lo = 0x1000;
+    ph->destination_load_address_lo = 0x2000;
+    ph->actual_partition_word_offset = 0x380 / 4;
+    ph->image_header_word_offset = 0x300 / 4;
+    ph->attributes = (1u << 8);
+
+    auto img = parse_image(reader);
+    assert(img.arch == Arch::ZynqMP);
+    const auto* named = find_partition(img, "FSBL10.ELF");
+    assert(named != nullptr);
+    assert(named->data_offset == 0x380);
+
+    std::cout << "[OK] zynqmp_ih_chain_name_extraction" << std::endl;
+}
+
+void test_partition_semantic_mapping_helpers() {
+    PartitionInfo arm_elf;
+    arm_elf.partition_type = PartitionType::Elf;
+    arm_elf.destination_device = DestinationDevice::PS;
+    arm_elf.processor_family = ProcessorFamily::Arm;
+    arm_elf.exec_address = 0x8000;
+
+    assert(partition_should_map_as_code(arm_elf));
+    assert(partition_is_executable_cpu(arm_elf));
+
+    PartitionInfo elf_no_exec = arm_elf;
+    elf_no_exec.exec_address = 0;
+    assert(partition_should_map_as_code(elf_no_exec));
+    assert(!partition_is_executable_cpu(elf_no_exec));
+
+    PartitionInfo config_part = arm_elf;
+    config_part.partition_type = PartitionType::Cdo;
+    assert(!partition_should_map_as_code(config_part));
+    assert(!partition_is_executable_cpu(config_part));
+
+    PartitionInfo pl_part = arm_elf;
+    pl_part.destination_device = DestinationDevice::PL;
+    assert(!partition_should_map_as_code(pl_part));
+    assert(!partition_is_executable_cpu(pl_part));
+
+    PartitionInfo encrypted_part = arm_elf;
+    encrypted_part.is_encrypted = true;
+    assert(!partition_should_map_as_code(encrypted_part));
+    assert(!partition_is_executable_cpu(encrypted_part));
+
+    PartitionInfo unknown_proc = arm_elf;
+    unknown_proc.processor_family = ProcessorFamily::Unknown;
+    assert(!partition_should_map_as_code(unknown_proc));
+    assert(!partition_is_executable_cpu(unknown_proc));
+
+    PartitionInfo auth_overlap = arm_elf;
+    auth_overlap.data_offset = 0x500;
+    auth_overlap.auth_certificate.present = true;
+    auth_overlap.auth_certificate.offset = 0x500;
+    assert(partition_payload_overlaps_auth_certificate(auth_overlap));
+
+    PartitionInfo auth_non_overlap = auth_overlap;
+    auth_non_overlap.auth_certificate.offset = 0x540;
+    assert(!partition_payload_overlaps_auth_certificate(auth_non_overlap));
+
+    std::cout << "[OK] partition_semantic_mapping_helpers" << std::endl;
+}
+
 void test_zynqmp_attribute_diagnostics() {
     MemoryReader reader(4096);
 
@@ -519,7 +662,9 @@ void test_zynq7000_partitions() {
     // Image Header Table
     auto* iht = reinterpret_cast<zynq7000::ImageHeaderTable*>(reader.data.data() + 0x100);
     iht->version = 0x01010000;
+    iht->count_of_image_header = 1;
     iht->first_partition_header_offset = 0x200 / 4; // -> 0x200
+    iht->first_image_header_offset = 0x800 / 4;
     
     // Partition Header 1
     auto* ph1 = reinterpret_cast<zynq7000::PartitionHeader*>(reader.data.data() + 0x200);
@@ -536,6 +681,11 @@ void test_zynq7000_partitions() {
     ac_header[1] = 0x00000001;
     ac_header[2] = 0x00000010;
     ac_header[3] = 0x89ABCDEF;
+
+    auto* ih1 = reinterpret_cast<zynq7000::ImageHeader*>(reader.data.data() + 0x800);
+    ih1->next_image_header_offset = 0;
+    ih1->corresponding_partition_header = 0x200 / 4;
+    ih1->partition_count = 1;
     
     // Set image name for PH1 at 0x800
     uint8_t packed[] = { 'L', 'B', 'S', 'F', 'E', '.', '0', '1', '\0', '\0', 'F', 'L', 0,0,0,0 };
@@ -554,7 +704,7 @@ void test_zynq7000_partitions() {
     assert(img.partitions[0].load_address == 0x10000000);
     assert(img.partitions[0].data_size == 1024);
     assert(img.partitions[0].destination_device == DestinationDevice::PS);
-    assert(img.partitions[0].partition_type == PartitionType::Elf);
+    assert(img.partitions[0].partition_type == PartitionType::Raw);
     assert(img.partitions[0].processor_family == ProcessorFamily::Arm);
     assert(img.partitions[0].arm_bitness_hint == ArmBitnessHint::AArch32);
     assert(img.partitions[0].has_auth_certificate);
@@ -683,6 +833,8 @@ int main() {
     test_zynqmp_detection();
     test_zynqmp_pmufw_prefix();
     test_zynqmp_partition_attr_decode();
+    test_zynqmp_ih_chain_name_extraction();
+    test_zynqmp_iht_checksum_valid();
     test_zynqmp_iht_checksum_warning();
     test_zynqmp_attribute_diagnostics();
     test_versal_detection();
@@ -690,6 +842,7 @@ int main() {
     test_versal_gen2_detection();
     test_weak_pdi_rejected();
     test_zynq7000_partitions();
+    test_partition_semantic_mapping_helpers();
     test_versal_partitions();
     
     std::cout << "All headless tests passed!" << std::endl;

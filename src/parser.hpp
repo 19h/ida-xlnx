@@ -248,6 +248,11 @@ using LogCallback = std::function<void(const std::string&)>;
 // Core parser logic
 ParsedImage parse_image(Reader& reader, LogCallback logger = nullptr);
 
+// Loader policy helpers for semantic partition mapping.
+bool partition_should_map_as_code(const PartitionInfo& partition);
+bool partition_is_executable_cpu(const PartitionInfo& partition);
+bool partition_payload_overlaps_auth_certificate(const PartitionInfo& partition);
+
 // Helper for image name unpacking
 std::string unpack_image_name(Reader& reader, uint32_t image_header_offset);
 

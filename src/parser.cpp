@@ -849,6 +849,35 @@ static void emit_attribute_diagnostics(PartitionInfo& part, ParsedImage& img, Lo
     }
 }
 
+bool partition_should_map_as_code(const PartitionInfo& partition) {
+    if (partition.is_encrypted) {
+        return false;
+    }
+    if (partition.destination_device == DestinationDevice::PL) {
+        return false;
+    }
+    if (is_configuration_partition_type(partition.partition_type)) {
+        return false;
+    }
+    if (partition.processor_family != ProcessorFamily::Arm &&
+        partition.processor_family != ProcessorFamily::MicroBlaze) {
+        return false;
+    }
+    if (partition.partition_type == PartitionType::Elf ||
+        partition.partition_type == PartitionType::RawElf) {
+        return true;
+    }
+    return has_valid_exec_address(partition.exec_address);
+}
+
+bool partition_is_executable_cpu(const PartitionInfo& partition) {
+    return partition_should_map_as_code(partition) && has_valid_exec_address(partition.exec_address);
+}
+
+bool partition_payload_overlaps_auth_certificate(const PartitionInfo& partition) {
+    return partition.auth_certificate.present && partition.auth_certificate.offset == partition.data_offset;
+}
+
 struct ProcessorFamilyScores {
     int arm = 0;
     int microblaze = 0;

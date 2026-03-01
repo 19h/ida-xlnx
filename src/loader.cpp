@@ -21,46 +21,6 @@ public:
     }
 };
 
-static bool is_configuration_partition_type(xilinx::PartitionType partition_type) {
-    return partition_type == xilinx::PartitionType::Cdo ||
-           partition_type == xilinx::PartitionType::CFrame ||
-           partition_type == xilinx::PartitionType::CfiGsrCscUnmask ||
-           partition_type == xilinx::PartitionType::CfiGsrCscMask;
-}
-
-static bool is_elf_like_partition_type(xilinx::PartitionType partition_type) {
-    return partition_type == xilinx::PartitionType::Elf ||
-           partition_type == xilinx::PartitionType::RawElf;
-}
-
-static bool has_valid_exec_address(uint64_t address) {
-    return address != 0 && address != 0xFFFFFFFFULL;
-}
-
-static bool should_map_partition_as_code(const xilinx::PartitionInfo& part) {
-    if (part.is_encrypted) {
-        return false;
-    }
-    if (part.destination_device == xilinx::DestinationDevice::PL) {
-        return false;
-    }
-    if (is_configuration_partition_type(part.partition_type)) {
-        return false;
-    }
-    if (part.processor_family != xilinx::ProcessorFamily::Arm &&
-        part.processor_family != xilinx::ProcessorFamily::MicroBlaze) {
-        return false;
-    }
-    if (is_elf_like_partition_type(part.partition_type)) {
-        return true;
-    }
-    return has_valid_exec_address(part.exec_address);
-}
-
-static bool is_executable_cpu_partition(const xilinx::PartitionInfo& part) {
-    return should_map_partition_as_code(part) && has_valid_exec_address(part.exec_address);
-}
-
 class XilinxBootLoader : public ida::loader::Loader {
 public:
     ida::Result<std::optional<ida::loader::AcceptResult>> accept(ida::loader::InputFile& file) override {
@@ -125,7 +85,7 @@ public:
             }
 
             const bool auth_blob_overlaps_payload =
-                part.auth_certificate.present && part.auth_certificate.offset == part.data_offset;
+                xilinx::partition_payload_overlaps_auth_certificate(part);
             if (auth_blob_overlaps_payload) {
                 ida::ui::message("SECURITY WARNING: Skipping partition '" + part.name +
                                  "' because payload offset points at authentication-certificate metadata.\n");
@@ -146,7 +106,9 @@ public:
             }
 
             if (part.data_size > 0 && part.load_address != 0xFFFFFFFFULL) {
-                const bool map_as_code = should_map_partition_as_code(part);
+                const bool map_as_code = xilinx::partition_should_map_as_code(part);
+                const bool executable_cpu_partition = xilinx::partition_is_executable_cpu(part);
+                const bool has_exec_address = part.exec_address != 0 && part.exec_address != 0xFFFFFFFFULL;
                 const char* segment_class = map_as_code ? "CODE" : "DATA";
                 const auto segment_type = map_as_code ? ida::segment::Type::Code : ida::segment::Type::Data;
                 ida::segment::create(
@@ -155,13 +117,13 @@ public:
                     part.name, segment_class, segment_type
                 );
                 ida::loader::file_to_database(file.handle(), part.data_offset, static_cast<ida::Address>(part.load_address), part.data_size, true);
-                if (!is_executable_cpu_partition(part) && has_valid_exec_address(part.exec_address)) {
+                if (!executable_cpu_partition && has_exec_address) {
                     ida::ui::message("WARNING: Not creating entry point for non-executable partition '" +
                                      part.name + "'.\n");
-                } else if (encrypted_payload && has_valid_exec_address(part.exec_address)) {
+                } else if (encrypted_payload && has_exec_address) {
                     ida::ui::message("SECURITY WARNING: Not creating entry point for encrypted partition '" +
                                      part.name + "'.\n");
-                } else if (is_executable_cpu_partition(part)) {
+                } else if (executable_cpu_partition) {
                     ida::entry::add(count, static_cast<ida::Address>(part.exec_address), part.name + "_entry");
                 }
             }
