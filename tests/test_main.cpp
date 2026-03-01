@@ -55,17 +55,87 @@ void test_zynqmp_detection() {
 }
 
 void test_versal_detection() {
-    MemoryReader reader(1024);
+    MemoryReader reader(8192);
+    auto write_u32 = [&](size_t off, uint32_t value) {
+        *reinterpret_cast<uint32_t*>(reader.data.data() + off) = value;
+    };
+
     uint32_t* words = reinterpret_cast<uint32_t*>(reader.data.data() + 0x10);
     words[0] = 0xAA995566;
     words[1] = 0x584C4E58; // XNLX
-    auto* bh = reinterpret_cast<versal::BootHeader*>(reader.data.data());
-    bh->meta_header_offset = 0x100;
+    write_u32(0xC4, 0x1000); // meta header offset (bytes)
+
+    write_u32(0x1000 + 0x00, 0x00040000); // Gen1 IHT version
+    write_u32(0x1000 + 0x04, 1);          // total images
+    write_u32(0x1000 + 0x08, 0x300 / 4);  // image header offset (word)
+    write_u32(0x1000 + 0x0C, 1);          // total partitions
+    write_u32(0x1000 + 0x10, 0x200 / 4);  // partition header offset (word)
+    write_u32(0x1000 + 0x28, 0x49445046); // FPDI
     
     auto img = parse_image(reader);
     assert(img.arch == Arch::VersalGen1);
     assert(img.format_name == "Xilinx Versal Adaptive SoC Gen 1 PDI");
     std::cout << "[OK] versal_detection" << std::endl;
+}
+
+void test_spartan_detection() {
+    MemoryReader reader(8192);
+    auto write_u32 = [&](size_t off, uint32_t value) {
+        *reinterpret_cast<uint32_t*>(reader.data.data() + off) = value;
+    };
+
+    write_u32(0x10, 0xAA995566);
+    write_u32(0x14, 0x584C4E58);
+    write_u32(0x1C, 0x400);      // source offset (bytes)
+    write_u32(0x2C, 0x100);      // PLM length
+    write_u32(0x30, 0x180);      // total PLM length
+    write_u32(0x33C, 0xA5A5A5A5);// checksum slot present
+    write_u32(0xC4, 0x24);       // user-defined revision field, not meta offset
+
+    auto img = parse_image(reader);
+    assert(img.arch == Arch::SpartanUltraScalePlus);
+    assert(img.format_name == "Xilinx Spartan UltraScale+ PDI");
+    std::cout << "[OK] spartan_detection" << std::endl;
+}
+
+void test_versal_gen2_detection() {
+    MemoryReader reader(0x50000);
+    auto write_u32 = [&](size_t off, uint32_t value) {
+        *reinterpret_cast<uint32_t*>(reader.data.data() + off) = value;
+    };
+
+    write_u32(0x10, 0xAA995566);
+    write_u32(0x14, 0x584C4E58);
+    write_u32(0x1C, 0x1200);      // source offset
+    write_u32(0x28, 0xA0);        // total PMC data length
+    write_u32(0x2C, 0x200);       // PLM length
+    write_u32(0x30, 0x280);       // total PLM length
+    write_u32(0x113C, 0xDEADBEEF);// checksum slot present
+
+    const uint32_t iht_offset = 0x1200 + 0x280 + 0xA0;
+    write_u32(iht_offset + 0x00, 0x00010000); // Gen2 IHT version
+    write_u32(iht_offset + 0x04, 1);          // total images
+    write_u32(iht_offset + 0x08, 0x40);       // image header offset
+    write_u32(iht_offset + 0x0C, 1);          // total partitions
+    write_u32(iht_offset + 0x10, 0x60);       // partition header offset
+    write_u32(iht_offset + 0x28, 0x49445046); // FPDI
+    write_u32(iht_offset + 0x2C, 0x00202020); // non-zero header sizes
+
+    auto img = parse_image(reader);
+    assert(img.arch == Arch::VersalGen2);
+    assert(img.format_name == "Xilinx Versal AI Edge/Prime Gen 2 PDI");
+    std::cout << "[OK] versal_gen2_detection" << std::endl;
+}
+
+void test_weak_pdi_rejected() {
+    MemoryReader reader(1024);
+    uint32_t* words = reinterpret_cast<uint32_t*>(reader.data.data() + 0x10);
+    words[0] = 0xAA995566;
+    words[1] = 0x584C4E58;
+
+    auto img = parse_image(reader);
+    assert(img.arch == Arch::Unknown);
+    std::cout << "[OK] weak_pdi_rejected" << std::endl;
 }
 
 void test_zynq7000_partitions() {
@@ -122,7 +192,7 @@ int main_old() {
 }
 
 void test_versal_partitions() {
-    MemoryReader reader(4096);
+    MemoryReader reader(0x5000);
     auto* bh = reinterpret_cast<versal::BootHeader*>(reader.data.data());
     bh->width_detection_word = 0xAA995566;
     bh->header_signature = 0x584C4E58;
@@ -131,10 +201,15 @@ void test_versal_partitions() {
     bh->pmc_data_load_address = 0x11223344;
     bh->pmc_data_length = 0x500;
     bh->total_plm_length = 0x2100;
-    bh->meta_header_offset = 0x100;
+    bh->meta_header_offset = 0x1000;
     
-    auto* iht = reinterpret_cast<versal::ImageHeaderTable*>(reader.data.data() + 0x100);
+    auto* iht = reinterpret_cast<versal::ImageHeaderTable*>(reader.data.data() + 0x1000);
+    iht->version = 0x00040000;
+    iht->total_number_of_images = 1;
+    iht->image_header_offset = 0x300 / 4;
+    iht->total_number_of_partitions = 1;
     iht->partition_header_offset = 0x200 / 4;
+    iht->identification_string = 0x49445046; // FPDI
     
     auto* ph1 = reinterpret_cast<versal::PartitionHeader*>(reader.data.data() + 0x200);
     ph1->unencrypted_data_word_length = 0x400 / 4;
@@ -171,6 +246,9 @@ int main() {
     test_zynq7000_detection();
     test_zynqmp_detection();
     test_versal_detection();
+    test_spartan_detection();
+    test_versal_gen2_detection();
+    test_weak_pdi_rejected();
     test_zynq7000_partitions();
     test_versal_partitions();
     

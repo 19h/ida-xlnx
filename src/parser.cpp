@@ -24,12 +24,225 @@ static std::string format_name_for_arch(Arch arch) {
     }
 }
 
-static bool looks_like_versal_gen1(Reader& reader) {
-    uint32_t meta_header_offset = reader.read_u32(0xC4);
-    if (meta_header_offset == 0 || meta_header_offset == 0xFFFFFFFF) {
+static bool read_u32_at(Reader& reader, uint32_t offset, uint32_t& value) {
+    return reader.read_bytes(offset, &value, sizeof(value));
+}
+
+static bool has_magic_at(Reader& reader, uint32_t width_offset, uint32_t signature_offset) {
+    uint32_t width = 0;
+    uint32_t signature = 0;
+    if (!read_u32_at(reader, width_offset, width)) {
         return false;
     }
-    return (meta_header_offset % 4) == 0;
+    if (!read_u32_at(reader, signature_offset, signature)) {
+        return false;
+    }
+    return width == 0xAA995566 && check_magic(signature);
+}
+
+static bool is_valid_word_offset(uint32_t value) {
+    return value != 0 && value != 0xFFFFFFFF && (value % 4) == 0;
+}
+
+static bool is_pdi_identification_string(uint32_t value) {
+    return value == 0x49445046 || value == 0x49445050; // FPDI / PPDI
+}
+
+static bool is_versal_gen1_iht_version(uint32_t version) {
+    return version == 0x00040000 || version == 0x00030000 || version == 0x00020000;
+}
+
+static bool has_versal_gen1_layout(Reader& reader, uint32_t meta_header_offset) {
+    if (!is_valid_word_offset(meta_header_offset) || meta_header_offset < 0xF80) {
+        return false;
+    }
+
+    uint32_t version = 0;
+    uint32_t total_images = 0;
+    uint32_t image_header_offset = 0;
+    uint32_t total_partitions = 0;
+    uint32_t partition_header_offset = 0;
+    uint32_t identification = 0;
+
+    if (!read_u32_at(reader, meta_header_offset + 0x00, version)) return false;
+    if (!read_u32_at(reader, meta_header_offset + 0x04, total_images)) return false;
+    if (!read_u32_at(reader, meta_header_offset + 0x08, image_header_offset)) return false;
+    if (!read_u32_at(reader, meta_header_offset + 0x0C, total_partitions)) return false;
+    if (!read_u32_at(reader, meta_header_offset + 0x10, partition_header_offset)) return false;
+    if (!read_u32_at(reader, meta_header_offset + 0x28, identification)) return false;
+
+    if (!is_versal_gen1_iht_version(version)) return false;
+    if (total_images == 0 || total_images > 64) return false;
+    if (total_partitions == 0 || total_partitions > 256) return false;
+    if (!is_valid_word_offset(image_header_offset)) return false;
+    if (!is_valid_word_offset(partition_header_offset)) return false;
+    if (!is_pdi_identification_string(identification)) return false;
+
+    return true;
+}
+
+static bool has_spartan_layout(Reader& reader) {
+    uint32_t source_offset = 0;
+    uint32_t plm_length = 0;
+    uint32_t total_plm_length = 0;
+    uint32_t checksum_at_33c = 0;
+
+    if (!read_u32_at(reader, 0x1C, source_offset)) return false;
+    if (!read_u32_at(reader, 0x2C, plm_length)) return false;
+    if (!read_u32_at(reader, 0x30, total_plm_length)) return false;
+    if (!read_u32_at(reader, 0x33C, checksum_at_33c)) return false;
+
+    (void)checksum_at_33c;
+
+    if (!is_valid_word_offset(source_offset)) return false;
+    if (source_offset < 0x340 || source_offset >= 0xF80) return false;
+    if (plm_length == 0 || plm_length == 0xFFFFFFFF) return false;
+    if (total_plm_length == 0 || total_plm_length == 0xFFFFFFFF) return false;
+    if (total_plm_length < plm_length) return false;
+
+    return true;
+}
+
+static bool has_versal_gen2_iht_layout(Reader& reader, uint32_t iht_offset) {
+    uint32_t version = 0;
+    uint32_t total_images = 0;
+    uint32_t image_header_offset = 0;
+    uint32_t total_partitions = 0;
+    uint32_t partition_header_offset = 0;
+    uint32_t identification = 0;
+    uint32_t header_sizes = 0;
+
+    if (!read_u32_at(reader, iht_offset + 0x00, version)) return false;
+    if (!read_u32_at(reader, iht_offset + 0x04, total_images)) return false;
+    if (!read_u32_at(reader, iht_offset + 0x08, image_header_offset)) return false;
+    if (!read_u32_at(reader, iht_offset + 0x0C, total_partitions)) return false;
+    if (!read_u32_at(reader, iht_offset + 0x10, partition_header_offset)) return false;
+    if (!read_u32_at(reader, iht_offset + 0x28, identification)) return false;
+    if (!read_u32_at(reader, iht_offset + 0x2C, header_sizes)) return false;
+
+    if (version != 0x00010000) return false;
+    if (total_images == 0 || total_images > 32) return false;
+    if (total_partitions == 0 || total_partitions > 32) return false;
+    if (!is_valid_word_offset(image_header_offset)) return false;
+    if (!is_valid_word_offset(partition_header_offset)) return false;
+    if (!is_pdi_identification_string(identification)) return false;
+
+    const uint32_t iht_words = header_sizes & 0xFF;
+    const uint32_t image_header_words = (header_sizes >> 8) & 0xFF;
+    const uint32_t partition_header_words = (header_sizes >> 16) & 0xFF;
+    if (iht_words == 0 || image_header_words == 0 || partition_header_words == 0) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool find_versal_gen2_iht_offset(Reader& reader,
+                                        uint32_t source_offset,
+                                        uint32_t total_plm_length,
+                                        uint32_t total_pmc_data_length,
+                                        uint32_t& out_iht_offset) {
+    const uint64_t candidate_offsets[] = {
+        static_cast<uint64_t>(source_offset) + total_plm_length,
+        static_cast<uint64_t>(source_offset) + total_plm_length + total_pmc_data_length,
+    };
+
+    for (uint64_t candidate : candidate_offsets) {
+        if (candidate > 0xFFFFFFFFULL) continue;
+        const uint32_t candidate32 = static_cast<uint32_t>(candidate);
+        if (!is_valid_word_offset(candidate32)) continue;
+        if (has_versal_gen2_iht_layout(reader, candidate32)) {
+            out_iht_offset = candidate32;
+            return true;
+        }
+    }
+
+    uint64_t scan_start = source_offset;
+    if (scan_start < 0x1140) {
+        scan_start = 0x1140;
+    }
+    const uint64_t scan_end = scan_start + 0x40000;
+    for (uint64_t off = scan_start; off < scan_end; off += 4) {
+        if (off > 0xFFFFFFFFULL) break;
+        uint32_t version = 0;
+        if (!read_u32_at(reader, static_cast<uint32_t>(off), version)) {
+            break;
+        }
+        if (version != 0x00010000) {
+            continue;
+        }
+        if (has_versal_gen2_iht_layout(reader, static_cast<uint32_t>(off))) {
+            out_iht_offset = static_cast<uint32_t>(off);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+struct VersalGen2Probe {
+    bool boot_header_layout_valid = false;
+    bool iht_layout_valid = false;
+    uint32_t iht_offset = 0;
+};
+
+static VersalGen2Probe probe_versal_gen2(Reader& reader) {
+    VersalGen2Probe probe;
+
+    uint32_t source_offset = 0;
+    uint32_t total_pmc_data_length = 0;
+    uint32_t plm_length = 0;
+    uint32_t total_plm_length = 0;
+    uint32_t checksum_at_113c = 0;
+
+    if (!read_u32_at(reader, 0x1C, source_offset)) return probe;
+    if (!read_u32_at(reader, 0x28, total_pmc_data_length)) return probe;
+    if (!read_u32_at(reader, 0x2C, plm_length)) return probe;
+    if (!read_u32_at(reader, 0x30, total_plm_length)) return probe;
+    if (!read_u32_at(reader, 0x113C, checksum_at_113c)) return probe;
+
+    (void)checksum_at_113c;
+
+    if (!is_valid_word_offset(source_offset)) return probe;
+    if (source_offset < 0x1140) return probe;
+    if (plm_length == 0 || plm_length == 0xFFFFFFFF) return probe;
+    if (total_plm_length == 0 || total_plm_length == 0xFFFFFFFF) return probe;
+    if (total_plm_length < plm_length) return probe;
+
+    probe.boot_header_layout_valid = true;
+    probe.iht_layout_valid = find_versal_gen2_iht_offset(reader,
+                                                          source_offset,
+                                                          total_plm_length,
+                                                          total_pmc_data_length,
+                                                          probe.iht_offset);
+    return probe;
+}
+
+static Arch classify_pdi_arch(Reader& reader, LogCallback logger) {
+    const VersalGen2Probe gen2_probe = probe_versal_gen2(reader);
+    if (gen2_probe.boot_header_layout_valid && gen2_probe.iht_layout_valid) {
+        return Arch::VersalGen2;
+    }
+    if (gen2_probe.boot_header_layout_valid && !gen2_probe.iht_layout_valid) {
+        if (logger) {
+            logger("PDI rejected: Gen2-like boot header found but Gen2 IHT layout is inconsistent.\n");
+        }
+        return Arch::Unknown;
+    }
+
+    if (has_spartan_layout(reader)) {
+        return Arch::SpartanUltraScalePlus;
+    }
+
+    uint32_t meta_header_offset = 0;
+    if (read_u32_at(reader, 0xC4, meta_header_offset) && has_versal_gen1_layout(reader, meta_header_offset)) {
+        return Arch::VersalGen1;
+    }
+
+    if (logger) {
+        logger("PDI rejected: signature matched at 0x10/0x14 but family-specific layout checks failed.\n");
+    }
+    return Arch::Unknown;
 }
 
 std::string unpack_image_name(Reader& reader, uint32_t image_header_offset) {
@@ -62,21 +275,18 @@ ParsedImage parse_image(Reader& reader, LogCallback logger) {
     ParsedImage img;
 
     // Detect Arch
-    uint32_t zynq_magic[4] = {0};
-    reader.read_bytes(0x20, zynq_magic, 16);
-    
-    if (zynq_magic[0] == 0xAA995566 && check_magic(zynq_magic[1])) {
-        if (zynq_magic[3] == 0x01010000) {
+    if (has_magic_at(reader, 0x20, 0x24)) {
+        uint32_t header_version = 0;
+        if (!read_u32_at(reader, 0x2C, header_version)) {
+            return img;
+        }
+        if (header_version == 0x01010000) {
             img.arch = Arch::Zynq7000;
         } else {
             img.arch = Arch::ZynqMP;
         }
-    } else {
-        uint32_t pdi_magic[2] = {0};
-        reader.read_bytes(0x10, pdi_magic, 8);
-        if (pdi_magic[0] == 0xAA995566 && check_magic(pdi_magic[1])) {
-            img.arch = looks_like_versal_gen1(reader) ? Arch::VersalGen1 : Arch::PDI;
-        }
+    } else if (has_magic_at(reader, 0x10, 0x14)) {
+        img.arch = classify_pdi_arch(reader, logger);
     }
 
     if (img.arch == Arch::Unknown) return img;
