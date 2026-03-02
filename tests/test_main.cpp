@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cassert>
 #include <cstdlib>
+#include <optional>
 
 using namespace xilinx;
 
